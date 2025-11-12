@@ -1,0 +1,38 @@
+# Qwen3-0.6B 基础配置
+base_model:
+  name: "Qwen/Qwen3-0.6B"
+  hidden_size: 1024
+  num_attention_heads: 16
+  num_key_value_heads: 8  # GQA配置
+  num_hidden_layers: 28
+  vocab_size: 151936
+  max_position_embeddings: 32768
+
+# 草稿模型配置
+draft_model:
+  sampling_strategy: "uniform"  # uniform, geometric, logarithmic
+  num_sampled_layers: 6
+  sampled_indices: [0, 5, 11, 16, 22, 27]  # 均匀采样示例
+  add_knowledge_enhancement: true
+  knowledge_retrieval_topk: 3
+
+# 知识增强配置
+knowledge_enhancement:
+  enabled: true  # 启用知识增强训练
+  cache_dim: 512
+  cross_attention_heads: 8
+  fusion_gate: true
+  retrieval_threshold: 0.7
+
+# 训练配置
+training:
+  batch_size: 8
+  learning_rate: 3e-5
+  num_epochs: 5
+  warmup_ratio: 0.1
+  max_seq_length: 2048
+  gradient_accumulation_steps: 2
+  use_knowledge_distillation: true
+  kl_divergence_weight: 0.8
+  acceptance_loss_weight: 0.3  # 接受概率损失权重（方案A：优化接受率）
+
