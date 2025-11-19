@@ -41,14 +41,29 @@ def load_models(config_path: str, checkpoint_path: str = None):
     knowledge_cache_manager = None
     
     if os.path.exists(cache_path):
-        cache_data = torch.load(cache_path, map_location='cpu')
+        # 使用weights_only=False以支持numpy数组（embeddings）
+        cache_data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        
+        # 获取配置
+        knowledge_config = config.get('knowledge_enhancement', {})
+        use_vector_retrieval = knowledge_config.get('use_vector_retrieval', True)
+        embedding_model_name = knowledge_config.get('embedding_model_name', None)
+        
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=config['base_model']['hidden_size'],
             num_heads=config['base_model']['num_attention_heads'],
-            cache_dim=config['knowledge_enhancement']['cache_dim']
+            cache_dim=config['knowledge_enhancement']['cache_dim'],
+            use_vector_retrieval=use_vector_retrieval,
+            embedding_model_name=embedding_model_name
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
+        
+        # 恢复embeddings（如果存在）
+        if 'knowledge_embeddings' in cache_data:
+            knowledge_cache_manager.knowledge_embeddings = cache_data['knowledge_embeddings']
+        
         print(f"✓ 知识缓存加载完成，共 {len(knowledge_cache_manager.kv_cache)} 个知识项")
+        print(f"  检索方法: {knowledge_cache_manager.get_retrieval_method()}")
     
     # 创建草稿模型
     print("\n3. 创建草稿模型...")
@@ -69,17 +84,26 @@ def load_models(config_path: str, checkpoint_path: str = None):
     if checkpoint_path and os.path.exists(checkpoint_path):
         print(f"\n4. 加载模型权重: {checkpoint_path}")
         checkpoint = torch.load(checkpoint_path, map_location='cpu')
-        draft_model.load_state_dict(checkpoint['model_state_dict'])
+        # 使用strict=False以兼容模型结构变化（如新增的归一化层）
+        missing_keys, unexpected_keys = draft_model.load_state_dict(checkpoint['model_state_dict'], strict=False)
         print(f"✓ 模型权重加载完成")
         print(f"  - Epoch: {checkpoint.get('epoch', 'N/A')}")
         print(f"  - 验证损失: {checkpoint.get('val_loss', 0):.4f}")
+        if missing_keys:
+            print(f"  ⚠ 缺失的键: {len(missing_keys)}个（可能是新增的层）")
+        if unexpected_keys:
+            print(f"  ⚠ 多余的键: {len(unexpected_keys)}个")
     else:
         print(f"\n⚠ 未找到训练好的模型，使用未训练的模型")
     
     return draft_model, target_model, tokenizer
 
-def analyze_question(draft_model, target_model, tokenizer, question: str, max_new_tokens: int = 5):
-    """分析单个问题"""
+def analyze_question(draft_model, target_model, tokenizer, question: str, max_new_tokens: int = 5, temperature: float = 0.7):
+    """分析单个问题
+    
+    Args:
+        temperature: 温度缩放参数，<1使分布更尖锐（提高确定性），>1使分布更平滑（增加多样性）
+    """
     print(f"\n{'='*70}")
     print(f"问题: {question}")
     print(f"{'='*70}")
@@ -111,8 +135,11 @@ def analyze_question(draft_model, target_model, tokenizer, question: str, max_ne
                 query_text=question
             )
             draft_logits = draft_outputs['logits'][:, -1, :]
-            draft_probs = torch.softmax(draft_logits, dim=-1)
-            draft_token_id = torch.argmax(draft_logits, dim=-1).item()
+            
+            # 应用温度缩放
+            scaled_logits = draft_logits / temperature
+            draft_probs = torch.softmax(scaled_logits, dim=-1)
+            draft_token_id = torch.argmax(scaled_logits, dim=-1).item()
             draft_token_text = tokenizer.decode([draft_token_id])
             draft_token_prob = draft_probs[0, draft_token_id].item()
             
@@ -188,25 +215,53 @@ def main():
     # 加载模型
     draft_model, target_model, tokenizer = load_models(config_path)
     
-    # 测试问题（这些都在知识库中）
-    questions = [
-        "深度学习是",
-        "自然语言处理是",
-        "Transformer架构是",
-        "预训练语言模型是",
-        "强化学习是"
+    # 测试问题（训练集:非训练集 = 4:1）
+    # 训练集问题（来自知识库，16个，80%）
+    training_questions = [
+        "深度学习是",  # 在知识库中
+        "自然语言处理是",  # 在知识库中
+        "Transformer架构是",  # 在知识库中
+        "预训练语言模型是",  # 在知识库中
+        "强化学习是",  # 在知识库中
+        "计算机视觉是",  # 在知识库中
+        "大数据技术是",  # 在知识库中
+        "云计算是",  # 在知识库中
+        "区块链技术是",  # 在知识库中
+        "物联网是",  # 在知识库中
+        "机器学习是",  # 在知识库中（机器学习的基本原理）
+        "注意力机制是",  # 在知识库中（注意力机制的作用）
+        "BERT和GPT是",  # 在知识库中（BERT和GPT的区别）
+        "神经网络是",  # 在知识库中（神经网络的工作原理）
+        "人工智能发展是",  # 在知识库中（人工智能的发展历史）
+        "图像识别是",  # 在知识库中（计算机视觉相关）
     ]
     
+    # 非训练集问题（不在知识库中，4个，20%）
+    non_training_questions = [
+        "量子计算是",  # 不在知识库中
+        "边缘计算是",  # 不在知识库中
+        "联邦学习是",  # 不在知识库中
+        "元学习是",  # 不在知识库中
+    ]
+    
+    questions = training_questions + non_training_questions
+    
     print("\n" + "="*70)
-    print("知识库问题推理分析")
+    print("多样化问题推理分析")
     print("="*70)
     print(f"\n测试问题数量: {len(questions)}")
-    print("注意: 这些问题都在知识库中，应该能看到知识增强的效果")
+    print(f"  - 训练集问题: {len(training_questions)} 个 (80%)")
+    print(f"  - 非训练集问题: {len(non_training_questions)} 个 (20%)")
+    print("注意: 训练集问题在知识库中，非训练集问题用于测试泛化能力")
     
     all_results = []
     
+    # 使用温度缩放（0.7使分布更尖锐，提高确定性）
+    temperature = 0.7
+    print(f"\n使用温度缩放: {temperature} (降低温度使分布更尖锐，提高接受率)")
+    
     for question in questions:
-        results = analyze_question(draft_model, target_model, tokenizer, question, max_new_tokens=5)
+        results = analyze_question(draft_model, target_model, tokenizer, question, max_new_tokens=5, temperature=temperature)
         all_results.append(results)
     
     # 总体汇总
@@ -227,10 +282,33 @@ def main():
     print(f"接受概率中位数: {np.median(all_acceptance_probs):.6f}")
     
     print(f"\n各问题详细结果:")
-    for i, r in enumerate(all_results, 1):
+    print("\n【训练集问题】:")
+    for i, r in enumerate(all_results[:len(training_questions)], 1):
         print(f"  {i}. {r['question']}")
         print(f"     接受率: {r['acceptance_rate']:.2%}")
         print(f"     平均接受概率: {r['avg_acceptance_prob']:.6f}")
+    
+    print("\n【非训练集问题】:")
+    for i, r in enumerate(all_results[len(training_questions):], 1):
+        print(f"  {i}. {r['question']}")
+        print(f"     接受率: {r['acceptance_rate']:.2%}")
+        print(f"     平均接受概率: {r['avg_acceptance_prob']:.6f}")
+    
+    # 分别统计训练集和非训练集的表现
+    training_results = all_results[:len(training_questions)]
+    non_training_results = all_results[len(training_questions):]
+    
+    training_accepted = sum(sum(r['is_accepted']) for r in training_results)
+    training_total = sum(len(r['is_accepted']) for r in training_results)
+    training_rate = training_accepted / training_total if training_total > 0 else 0.0
+    
+    non_training_accepted = sum(sum(r['is_accepted']) for r in non_training_results)
+    non_training_total = sum(len(r['is_accepted']) for r in non_training_results)
+    non_training_rate = non_training_accepted / non_training_total if non_training_total > 0 else 0.0
+    
+    print(f"\n【分类统计】:")
+    print(f"  训练集问题接受率: {training_rate:.2%} ({training_accepted}/{training_total})")
+    print(f"  非训练集问题接受率: {non_training_rate:.2%} ({non_training_accepted}/{non_training_total})")
     
     print("\n" + "="*70)
     print("分析完成！")

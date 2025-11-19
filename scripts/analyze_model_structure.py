@@ -111,12 +111,12 @@ def main():
     print("="*70)
     
     # 加载配置
-    with open('configs/qwen3_0.6b_config.yaml', 'r', encoding='utf-8') as f:
+    with open('/Users/chuang.yan/PycharmProjects/CrossAndAttention/configs/qwen3_0.6b_config.yaml', 'r', encoding='utf-8') as f:
         config = yaml.safe_load(f)
     
     # 加载基础模型
     print("\n1. 加载基础模型...")
-    loader = Qwen3Loader('configs/qwen3_0.6b_config.yaml')
+    loader = Qwen3Loader('/Users/chuang.yan/PycharmProjects/CrossAndAttention/configs/qwen3_0.6b_config.yaml')
     target_model = loader.load_target_model(device='cpu')
     tokenizer = loader.load_tokenizer()
     
@@ -126,14 +126,29 @@ def main():
     
     if Path(cache_path).exists():
         from models.knowledge_cache import KnowledgeCacheManager
-        cache_data = torch.load(cache_path, map_location='cpu')
+        # 使用weights_only=False以支持numpy数组（embeddings）
+        cache_data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        
+        # 获取配置
+        knowledge_config = config.get('knowledge_enhancement', {})
+        use_vector_retrieval = knowledge_config.get('use_vector_retrieval', True)
+        embedding_model_name = knowledge_config.get('embedding_model_name', None)
+        
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=config['base_model']['hidden_size'],
             num_heads=config['base_model']['num_attention_heads'],
-            cache_dim=config['knowledge_enhancement']['cache_dim']
+            cache_dim=config['knowledge_enhancement']['cache_dim'],
+            use_vector_retrieval=use_vector_retrieval,
+            embedding_model_name=embedding_model_name
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
+        
+        # 恢复embeddings（如果存在）
+        if 'knowledge_embeddings' in cache_data:
+            knowledge_cache_manager.knowledge_embeddings = cache_data['knowledge_embeddings']
+        
         print("✓ 知识缓存加载完成")
+        print(f"  检索方法: {knowledge_cache_manager.get_retrieval_method()}")
     
     # 创建草稿模型
     print("\n2. 创建草稿模型...")

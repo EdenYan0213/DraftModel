@@ -24,7 +24,7 @@ def main():
     print("="*70)
     
     # 加载配置
-    config_path = "configs/qwen3_0.6b_config.yaml"
+    config_path = "/Users/chuang.yan/PycharmProjects/CrossAndAttention/configs/qwen3_0.6b_config.yaml"
     if not os.path.exists(config_path):
         print(f"错误: 配置文件不存在: {config_path}")
         return
@@ -54,20 +54,32 @@ def main():
     
     if os.path.exists(cache_path):
         print(f"从 {cache_path} 加载知识缓存...")
-        cache_data = torch.load(cache_path, map_location='cpu')
+        # 使用weights_only=False以支持numpy数组（embeddings）
+        cache_data = torch.load(cache_path, map_location='cpu', weights_only=False)
         
         base_config = config['base_model']
         knowledge_config = config.get('knowledge_enhancement', {})
         
+        # 创建知识缓存管理器（启用向量检索）
+        use_vector_retrieval = knowledge_config.get('use_vector_retrieval', True)
+        embedding_model_name = knowledge_config.get('embedding_model_name', None)
+        
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=base_config['hidden_size'],
             num_heads=base_config['num_attention_heads'],
-            cache_dim=knowledge_config.get('cache_dim', 512)
+            cache_dim=knowledge_config.get('cache_dim', 512),
+            use_vector_retrieval=use_vector_retrieval,
+            embedding_model_name=embedding_model_name
         )
         
         # 恢复缓存数据
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
         knowledge_cache_manager.compressed_cache = cache_data.get('compressed_cache', {})
+        
+        # 恢复embeddings（如果存在）
+        if 'knowledge_embeddings' in cache_data:
+            knowledge_cache_manager.knowledge_embeddings = cache_data['knowledge_embeddings']
+            print(f"✓ 已恢复 {len(knowledge_cache_manager.knowledge_embeddings)} 个知识项的embeddings")
         
         # 恢复压缩/解压缩器（如果保存了）
         if 'compressor_state' in cache_data:
@@ -76,6 +88,7 @@ def main():
             knowledge_cache_manager.kv_decompressor.load_state_dict(cache_data['decompressor_state'])
         
         print(f"✓ 知识缓存加载完成，共 {len(knowledge_cache_manager.kv_cache)} 个知识项")
+        print(f"  检索方法: {knowledge_cache_manager.get_retrieval_method()}")
     else:
         print(f"⚠ 知识缓存文件不存在: {cache_path}")
         if knowledge_enabled:
@@ -152,7 +165,7 @@ def main():
         if 'perplexity' in val_metrics:
             print(f"验证困惑度: {val_metrics['perplexity']:.2f}")
         
-        # 保存最佳模型
+        # 保存最佳模型（如果更好）
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             checkpoint_path = os.path.join(checkpoint_dir, f"best_draft_model_knowledge_epoch{epoch+1}.pth")
@@ -168,18 +181,20 @@ def main():
             }, checkpoint_path)
             print(f"✓ 最佳模型已保存: {checkpoint_path} (loss: {val_loss:.4f})")
         
-        # 保存epoch检查点
-        epoch_checkpoint = os.path.join(checkpoint_dir, f"draft_model_knowledge_epoch{epoch+1}.pth")
-        torch.save({
-            'epoch': epoch + 1,
-            'model_state_dict': draft_model.state_dict(),
-            'optimizer_state_dict': trainer.optimizer.state_dict(),
-            'scheduler_state_dict': trainer.scheduler.state_dict(),
-            'train_loss': train_loss,
-            'val_loss': val_loss,
-            'sampled_indices': draft_model.sampled_indices,
-            'knowledge_enabled': knowledge_enabled
-        }, epoch_checkpoint)
+        # 每5个epoch保存一次模型权重
+        if (epoch + 1) % 5 == 0:
+            epoch_checkpoint = os.path.join(checkpoint_dir, f"draft_model_knowledge_epoch{epoch+1}.pth")
+            torch.save({
+                'epoch': epoch + 1,
+                'model_state_dict': draft_model.state_dict(),
+                'optimizer_state_dict': trainer.optimizer.state_dict(),
+                'scheduler_state_dict': trainer.scheduler.state_dict(),
+                'train_loss': train_loss,
+                'val_loss': val_loss,
+                'sampled_indices': draft_model.sampled_indices,
+                'knowledge_enabled': knowledge_enabled
+            }, epoch_checkpoint)
+            print(f"✓ Epoch {epoch+1} 检查点已保存: {epoch_checkpoint}")
     
     # 保存最终模型
     final_path = os.path.join(checkpoint_dir, "final_draft_model_knowledge.pth")

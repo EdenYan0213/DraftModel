@@ -198,48 +198,86 @@ class EnhancedDraftLayer(nn.Module):
             self.knowledge_enhancer = KnowledgeEnhancedCrossAttention(
                 hidden_size, num_heads
             )
+            # Cross-Attention之后的归一化层（如果Cross-Attention内部有Norm，这个可以移除，但保留以保持一致性）
+            self.cross_attention_layernorm = nn.LayerNorm(hidden_size)
     
     def forward(self, 
                 hidden_states: torch.Tensor,
                 attention_mask: Optional[torch.Tensor] = None,
                 knowledge_cache: Optional[Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]] = None,
                 **kwargs) -> torch.Tensor:
+        """
+        前向传播：Self-Attention -> CrossAttention -> MLP
+        """
+        # Step 1: Input LayerNorm
+        residual = hidden_states
+        hidden_states = self.input_layernorm(hidden_states)
         
-        # 调用原始层（Self-Attention + MLP）
-        original_output = self.original_layer(
+        # Step 2: Self-Attention
+        self_attn_outputs = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             **kwargs
         )
         
-        # 提取hidden_states
-        if isinstance(original_output, tuple):
-            hidden_states = original_output[0]
+        # 提取self-attention的输出
+        if isinstance(self_attn_outputs, tuple):
+            hidden_states = self_attn_outputs[0]
         else:
-            hidden_states = original_output
+            hidden_states = self_attn_outputs
         
-        # 知识增强逻辑
+        # Step 2.1: Self-Attention -> Add & Norm
+        hidden_states = residual + hidden_states
+        # 注意：Qwen3使用Pre-Norm，所以Self-Attention之前已经Norm过了
+        # 但为了保持一致性，这里也可以添加一个Norm（可选）
+        # 暂时不添加，保持与原始Qwen3结构一致
+        
+        # Step 3: Cross-Attention (知识增强) - 在Self-Attention之后，MLP之前
         if self.use_knowledge_enhancement and self.knowledge_enhancer is not None:
             if knowledge_cache is not None:
+                # 保存残差连接的输入
+                cross_attn_residual = hidden_states
+                
                 # 处理knowledge_cache
                 if isinstance(knowledge_cache, tuple):
                     # 直接提供KV矩阵
                     knowledge_keys, knowledge_values = knowledge_cache
-                    enhanced_states = self.knowledge_enhancer(
+                    cross_attn_output = self.knowledge_enhancer(
                         hidden_states,
                         knowledge_keys=knowledge_keys,
                         knowledge_values=knowledge_values,
                         attention_mask=attention_mask
                     )
-                    return enhanced_states
                 elif isinstance(knowledge_cache, torch.Tensor):
                     # 压缩的缓存向量
-                    enhanced_states = self.knowledge_enhancer(
+                    cross_attn_output = self.knowledge_enhancer(
                         hidden_states,
                         knowledge_cache=knowledge_cache,
                         attention_mask=attention_mask
                     )
-                    return enhanced_states
+                
+                # Step 3.1: Cross-Attention -> Add & Norm
+                # Cross-Attention内部已经有LayerNorm（在门控融合后），
+                # 但为了遵循标准的Add & Norm模式，我们在Add之后再Norm一次
+                hidden_states = cross_attn_residual + cross_attn_output
+                # 添加Norm以确保稳定性（Cross-Attention内部虽然有Norm，但Add之后需要再次Norm）
+                hidden_states = self.cross_attention_layernorm(hidden_states)
+        
+        # Step 4: Post-Attention LayerNorm (用于MLP)
+        residual = hidden_states
+        hidden_states = self.post_attention_layernorm(hidden_states)
+        
+        # Step 5: MLP/FFN
+        mlp_outputs = self.mlp(hidden_states)
+        
+        # 提取MLP的输出
+        if isinstance(mlp_outputs, tuple):
+            mlp_hidden_states = mlp_outputs[0]
+        else:
+            mlp_hidden_states = mlp_outputs
+        
+        # 残差连接
+        hidden_states = residual + mlp_hidden_states
         
         return hidden_states
 
@@ -398,6 +436,7 @@ class Qwen3DraftModel(nn.Module):
             attention_mask = None
         
         # 每层：Self-Attention -> CrossAttention(使用缓存的KV) -> MLP
+        # 注意：Cross-Attention在Self-Attention之后、MLP之前执行
         for i, layer in enumerate(self.enhanced_layers):
             hidden_states = layer(
                 hidden_states,

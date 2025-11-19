@@ -10,6 +10,7 @@ from .knowledge_enhanced_draft import (
     KnowledgeEnhancedCrossAttention
 )
 from .knowledge_cache import KnowledgeCacheManager
+from .simple_draft_model import SimpleDraftModel, SimpleCrossAttention
 
 __all__ = [
     'Qwen3Loader',
@@ -17,6 +18,8 @@ __all__ = [
     'Qwen3DraftModel',
     'EnhancedDraftLayer',
     'KnowledgeEnhancedCrossAttention',
-    'KnowledgeCacheManager'
+    'KnowledgeCacheManager',
+    'SimpleDraftModel',
+    'SimpleCrossAttention'
 ]
 

@@ -1,5 +1,6 @@
 """
 知识缓存管理器 - 缓存常见问题的KV矩阵
+支持向量相似度检索
 """
 
 import torch
@@ -8,20 +9,31 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 from collections import defaultdict
 
+try:
+    from sentence_transformers import SentenceTransformer
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+    print("警告: sentence-transformers 未安装，将使用字符串匹配检索")
+
 class KnowledgeCacheManager:
     """知识缓存管理器 - 存储和检索常见问题的KV矩阵"""
     
-    def __init__(self, hidden_size: int, num_heads: int, cache_dim: int = 512):
+    def __init__(self, hidden_size: int, num_heads: int, cache_dim: int = 512, 
+                 use_vector_retrieval: bool = True, embedding_model_name: str = None):
         """
         Args:
             hidden_size: 隐藏层维度
             num_heads: 注意力头数
             cache_dim: 缓存维度（用于压缩存储）
+            use_vector_retrieval: 是否使用向量检索（默认True）
+            embedding_model_name: embedding模型名称（默认使用中文模型）
         """
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.cache_dim = cache_dim
+        self.use_vector_retrieval = use_vector_retrieval and SENTENCE_TRANSFORMERS_AVAILABLE
         
         # 存储缓存的KV矩阵
         # key: 问题/主题标识, value: (keys, values) 元组
@@ -29,6 +41,28 @@ class KnowledgeCacheManager:
         
         # 存储压缩后的缓存（用于快速检索）
         self.compressed_cache: Dict[str, torch.Tensor] = {}
+        
+        # 向量检索相关
+        self.knowledge_embeddings: Dict[str, np.ndarray] = {}  # 存储知识项的向量
+        self.embedding_model = None
+        
+        if self.use_vector_retrieval:
+            try:
+                # 使用中文embedding模型（如果没有指定，使用轻量级模型）
+                if embedding_model_name is None:
+                    # 使用轻量级中文模型
+                    embedding_model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
+                    # 如果上面的模型不可用，尝试其他模型
+                    # embedding_model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
+                
+                print(f"加载embedding模型: {embedding_model_name}")
+                self.embedding_model = SentenceTransformer(embedding_model_name)
+                print("✓ Embedding模型加载完成")
+            except Exception as e:
+                print(f"⚠ 警告: 无法加载embedding模型 {embedding_model_name}: {e}")
+                print("  将回退到字符串匹配检索")
+                self.use_vector_retrieval = False
+                self.embedding_model = None
         
         # KV投影层（用于压缩和解压缩）
         self.kv_compressor = nn.Sequential(
@@ -66,6 +100,14 @@ class KnowledgeCacheManager:
         # 存储原始KV
         self.kv_cache[key] = (keys.clone(), values.clone())
         
+        # 计算并存储embedding（用于向量检索）
+        if self.use_vector_retrieval and self.embedding_model is not None:
+            try:
+                embedding = self.embedding_model.encode(key, convert_to_numpy=True)
+                self.knowledge_embeddings[key] = embedding
+            except Exception as e:
+                print(f"警告: 计算embedding失败 ({key[:30]}...): {e}")
+        
         # 压缩存储（可选）
         if compress:
             try:
@@ -102,19 +144,92 @@ class KnowledgeCacheManager:
                 print(f"警告: 压缩知识缓存失败 ({key[:30]}...): {e}")
                 pass
 
-    #TODO 改为向量检索
-    def retrieve(self, query: str, topk: int = 1) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def retrieve(self, query: str, topk: int = 1, threshold: float = 0.5) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
         """
-        检索知识KV矩阵
+        检索知识KV矩阵（优先使用向量检索，失败时回退到字符串匹配）
         
         Args:
             query: 查询文本
-            topk: 返回top-k个最相关的知识
+            topk: 返回top-k个最相关的知识（当前实现只返回top-1）
+            threshold: 相似度阈值（0-1），低于此阈值不返回
         
         Returns:
             (keys, values) 元组，如果未找到返回None
         """
-        # 简单的关键词匹配（实际应该使用更复杂的检索方法，如向量相似度）
+        # 优先使用向量检索
+        if self.use_vector_retrieval and self.embedding_model is not None and self.knowledge_embeddings:
+            result = self.retrieve_by_similarity(query, topk=topk, threshold=threshold)
+            if result is not None:
+                return result
+        
+        # 回退到字符串匹配
+        return self.retrieve_by_string_match(query)
+    
+    def retrieve_by_similarity(self, query: str, topk: int = 1, threshold: float = 0.5) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        基于向量相似度检索知识
+        
+        Args:
+            query: 查询文本
+            topk: 返回top-k个最相关的知识
+            threshold: 相似度阈值
+        
+        Returns:
+            (keys, values) 元组，如果未找到返回None
+        """
+        if not self.knowledge_embeddings:
+            return None
+        
+        try:
+            # 计算查询的embedding
+            query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
+            
+            # 计算与所有知识项的相似度
+            similarities = []
+            for key, emb in self.knowledge_embeddings.items():
+                # 计算余弦相似度
+                similarity = self._cosine_similarity(query_embedding, emb)
+                if similarity >= threshold:
+                    similarities.append((key, similarity))
+            
+            if not similarities:
+                return None
+            
+            # 按相似度排序，返回Top-K
+            similarities.sort(key=lambda x: x[1], reverse=True)
+            
+            # 返回最相似的知识项
+            best_key = similarities[0][0]
+            keys, values = self.kv_cache[best_key]
+            
+            if len(similarities) > 1:
+                print(f"检索: '{query[:30]}...' -> '{best_key[:30]}...' (相似度: {similarities[0][1]:.3f})")
+            
+            return keys, values
+            
+        except Exception as e:
+            print(f"警告: 向量检索失败: {e}，回退到字符串匹配")
+            return None
+    
+    def _cosine_similarity(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        """计算余弦相似度"""
+        dot_product = np.dot(vec1, vec2)
+        norm1 = np.linalg.norm(vec1)
+        norm2 = np.linalg.norm(vec2)
+        if norm1 == 0 or norm2 == 0:
+            return 0.0
+        return dot_product / (norm1 * norm2)
+    
+    def retrieve_by_string_match(self, query: str) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """
+        基于字符串匹配检索知识（回退方法）
+        
+        Args:
+            query: 查询文本
+        
+        Returns:
+            (keys, values) 元组，如果未找到返回None
+        """
         query_lower = query.lower()
         
         # 查找匹配的缓存
@@ -124,7 +239,7 @@ class KnowledgeCacheManager:
                 matches.append(cache_key)
         
         if not matches:
-            # 如果没有精确匹配，返回第一个（或使用相似度检索）
+            # 如果没有精确匹配，返回第一个
             if self.kv_cache:
                 first_key = list(self.kv_cache.keys())[0]
                 keys, values = self.kv_cache[first_key]
@@ -211,8 +326,15 @@ class KnowledgeCacheManager:
         """清空缓存"""
         self.kv_cache.clear()
         self.compressed_cache.clear()
+        self.knowledge_embeddings.clear()
     
     def __len__(self):
         """返回缓存的知识数量"""
         return len(self.kv_cache)
+    
+    def get_retrieval_method(self) -> str:
+        """返回当前使用的检索方法"""
+        if self.use_vector_retrieval and self.embedding_model is not None:
+            return "vector_similarity"
+        return "string_match"
 

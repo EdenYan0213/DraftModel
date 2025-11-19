@@ -41,14 +41,29 @@ def load_models(config_path: str, checkpoint_path: str = None):
     knowledge_cache_manager = None
     
     if os.path.exists(cache_path):
-        cache_data = torch.load(cache_path, map_location='cpu')
+        # 使用weights_only=False以支持numpy数组（embeddings）
+        cache_data = torch.load(cache_path, map_location='cpu', weights_only=False)
+        
+        # 获取配置
+        knowledge_config = config.get('knowledge_enhancement', {})
+        use_vector_retrieval = knowledge_config.get('use_vector_retrieval', True)
+        embedding_model_name = knowledge_config.get('embedding_model_name', None)
+        
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=config['base_model']['hidden_size'],
             num_heads=config['base_model']['num_attention_heads'],
-            cache_dim=config['knowledge_enhancement']['cache_dim']
+            cache_dim=config['knowledge_enhancement']['cache_dim'],
+            use_vector_retrieval=use_vector_retrieval,
+            embedding_model_name=embedding_model_name
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
+        
+        # 恢复embeddings（如果存在）
+        if 'knowledge_embeddings' in cache_data:
+            knowledge_cache_manager.knowledge_embeddings = cache_data['knowledge_embeddings']
+        
         print(f"✓ 知识缓存加载完成，共 {len(knowledge_cache_manager.kv_cache)} 个知识项")
+        print(f"  检索方法: {knowledge_cache_manager.get_retrieval_method()}")
     
     # 创建草稿模型
     print("\n3. 创建草稿模型...")

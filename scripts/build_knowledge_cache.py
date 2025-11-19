@@ -20,7 +20,7 @@ def main():
     print("=== 构建知识缓存 ===")
     
     # 加载配置
-    config_path = "configs/qwen3_0.6b_config.yaml"
+    config_path = "/Users/chuang.yan/PycharmProjects/CrossAndAttention/configs/qwen3_0.6b_config.yaml"
     if not os.path.exists(config_path):
         print(f"错误: 配置文件不存在: {config_path}")
         return
@@ -41,11 +41,19 @@ def main():
     base_config = config['base_model']
     knowledge_config = config.get('knowledge_enhancement', {})
     
+    # 创建知识缓存管理器（启用向量检索）
+    use_vector_retrieval = knowledge_config.get('use_vector_retrieval', True)
+    embedding_model_name = knowledge_config.get('embedding_model_name', None)
+    
     cache_manager = KnowledgeCacheManager(
         hidden_size=base_config['hidden_size'],
         num_heads=base_config['num_attention_heads'],
-        cache_dim=knowledge_config.get('cache_dim', 512)
+        cache_dim=knowledge_config.get('cache_dim', 512),
+        use_vector_retrieval=use_vector_retrieval,
+        embedding_model_name=embedding_model_name
     )
+    
+    print(f"知识检索方法: {cache_manager.get_retrieval_method()}")
     
     # 定义常见问题和答案（问题+答案的完整序列）
     # 格式: (问题, 答案) 或 (问题, None) 表示需要模型生成答案
@@ -291,17 +299,24 @@ def main():
     
     # 保存缓存
     cache_path = os.path.join(cache_dir, "knowledge_cache.pth")
-    torch.save({
+    
+    # 准备保存数据
+    save_data = {
         'kv_cache': cache_manager.kv_cache,
         'compressed_cache': cache_manager.compressed_cache,
         'compressor_state': cache_manager.kv_compressor.state_dict(),
         'decompressor_state': cache_manager.kv_decompressor.state_dict(),
+        'knowledge_embeddings': cache_manager.knowledge_embeddings,  # 保存embeddings
         'config': {
             'hidden_size': base_config['hidden_size'],
             'num_heads': base_config['num_attention_heads'],
-            'cache_dim': knowledge_config.get('cache_dim', 512)
+            'cache_dim': knowledge_config.get('cache_dim', 512),
+            'use_vector_retrieval': use_vector_retrieval,
+            'embedding_model_name': embedding_model_name
         }
-    }, cache_path)
+    }
+    
+    torch.save(save_data, cache_path)
     
     print(f"知识缓存已保存到: {cache_path}")
     print(f"共缓存 {len(cache_manager)} 个知识项")

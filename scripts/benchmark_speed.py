@@ -102,7 +102,8 @@ def main():
     
     if os.path.exists(cache_path):
         from models.knowledge_cache import KnowledgeCacheManager
-        cache_data = torch.load(cache_path, map_location='cpu')
+        # 使用weights_only=False以支持numpy数组（embeddings）
+        cache_data = torch.load(cache_path, map_location='cpu', weights_only=False)
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=config['base_model']['hidden_size'],
             num_heads=config['base_model']['num_attention_heads'],
