@@ -69,7 +69,9 @@ def main():
             num_heads=base_config['num_attention_heads'],
             cache_dim=knowledge_config.get('cache_dim', 512),
             use_vector_retrieval=use_vector_retrieval,
-            embedding_model_name=embedding_model_name
+            embedding_model_name=embedding_model_name,
+            target_model=target_model,  # 使用目标模型的嵌入层
+            tokenizer=tokenizer  # 传入tokenizer
         )
         
         # 恢复缓存数据

@@ -16,6 +16,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from models.base_loader import Qwen3Loader
 from models.knowledge_enhanced_draft import Qwen3DraftModel
 from models.knowledge_cache import KnowledgeCacheManager
+from training.attention_alignment import align_with_attention
 
 def load_models(config_path: str, checkpoint_path: str = None):
     """加载模型"""
@@ -54,7 +55,9 @@ def load_models(config_path: str, checkpoint_path: str = None):
             num_heads=config['base_model']['num_attention_heads'],
             cache_dim=config['knowledge_enhancement']['cache_dim'],
             use_vector_retrieval=use_vector_retrieval,
-            embedding_model_name=embedding_model_name
+            embedding_model_name=embedding_model_name,
+            target_model=target_model,  # 使用目标模型的嵌入层
+            tokenizer=tokenizer  # 传入tokenizer
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
         

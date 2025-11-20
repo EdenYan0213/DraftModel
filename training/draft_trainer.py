@@ -6,6 +6,12 @@ from transformers import get_linear_schedule_with_warmup
 from tqdm import tqdm
 import os
 import sys
+try:
+    from .attention_alignment import compute_alignment_loss, AttentionAlignmentModule
+    ATTENTION_ALIGNMENT_AVAILABLE = True
+except ImportError:
+    ATTENTION_ALIGNMENT_AVAILABLE = False
+    print("⚠ 注意力对齐模块不可用，将跳过注意力对齐损失")
 import time
 import math
 from typing import Dict, Any, List, Optional
@@ -32,6 +38,26 @@ class DraftModelTrainer:
         self.use_distillation = training_config.get('use_knowledge_distillation', True)
         self.kl_weight = float(training_config.get('kl_divergence_weight', 0.8))
         self.acceptance_weight = float(training_config.get('acceptance_loss_weight', 0.3))  # 接受概率损失权重
+        self.alignment_weight = float(training_config.get('alignment_loss_weight', 0.2))  # 注意力对齐损失权重
+        self.newline_token_weight = float(training_config.get('newline_token_weight', 0.3))  # 换行符token权重（降低）
+        
+        # 识别换行符token ID
+        self.newline_token_ids = set()
+        for test_str in ['\n', '\r\n', '\r']:
+            try:
+                token_ids = self.tokenizer.encode(test_str, add_special_tokens=False)
+                self.newline_token_ids.update(token_ids)
+            except:
+                pass
+        if self.newline_token_ids:
+            print(f"识别到换行符token IDs: {self.newline_token_ids}，训练时将应用权重 {self.newline_token_weight}")
+        
+        # 注意力对齐模块
+        if ATTENTION_ALIGNMENT_AVAILABLE and self.alignment_weight > 0:
+            self.alignment_module = AttentionAlignmentModule(alpha=0.3, loss_type='kl')
+            print(f"✓ 启用注意力对齐损失，权重: {self.alignment_weight}")
+        else:
+            self.alignment_module = None
         
         # 训练状态
         self.optimizer = None
@@ -154,10 +180,11 @@ class DraftModelTrainer:
     
     def _compute_training_loss(self, inputs: Dict[str, torch.Tensor], texts: Optional[List[str]] = None) -> torch.Tensor:
         """计算训练损失"""
-        # 目标模型输出（教师）
+        # 目标模型输出（教师），需要attention权重
         with torch.no_grad():
-            target_outputs = self.target_model(**inputs)
+            target_outputs = self.target_model(**inputs, output_attentions=(self.alignment_module is not None))
             target_logits = target_outputs.logits
+            target_attentions = getattr(target_outputs, 'attentions', None)
         
         # 检索知识缓存（如果有）
         knowledge_cache = None
@@ -181,15 +208,17 @@ class DraftModelTrainer:
             if batch_kv_caches[0] is not None:
                 knowledge_cache = batch_kv_caches[0]
         
-        # 草稿模型输出（学生，使用知识缓存）
+        # 草稿模型输出（学生，使用知识缓存），需要attention权重
         draft_outputs = self.draft_model(
             input_ids=inputs['input_ids'],
             attention_mask=inputs['attention_mask'],
             knowledge_cache=knowledge_cache,  # 传递KV缓存
             retrieve_knowledge=(knowledge_cache is None),  # 如果没有提供缓存，尝试检索
-            query_text=texts[0] if texts else None
+            query_text=texts[0] if texts else None,
+            output_attentions=(self.alignment_module is not None)  # 需要attention
         )
         draft_logits = draft_outputs['logits']
+        draft_attentions = draft_outputs.get('attentions')
         
         # 检查logits是否包含NaN或Inf
         if torch.isnan(draft_logits).any() or torch.isinf(draft_logits).any():
@@ -228,6 +257,30 @@ class DraftModelTrainer:
                 print(f"\n⚠ 警告: 计算接受概率损失时出错: {e}，跳过")
                 acceptance_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         
+        # ========== 注意力引导的对齐损失 ==========
+        alignment_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        if self.alignment_module is not None and draft_attentions is not None and target_attentions is not None:
+            try:
+                # 提取最后一层的attention
+                draft_attn = draft_attentions[-1] if isinstance(draft_attentions, (list, tuple)) else draft_attentions
+                target_attn = target_attentions[-1] if isinstance(target_attentions, (list, tuple)) else target_attentions
+                
+                # 计算对齐损失
+                alignment_loss = compute_alignment_loss(
+                    draft_logits,
+                    target_logits,
+                    draft_attn,
+                    target_attn,
+                    loss_type='kl'
+                )
+                
+                if torch.isnan(alignment_loss) or torch.isinf(alignment_loss):
+                    print(f"\n⚠ 警告: 注意力对齐损失为NaN/Inf，跳过")
+                    alignment_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+            except Exception as e:
+                print(f"\n⚠ 警告: 计算注意力对齐损失时出错: {e}，跳过")
+                alignment_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+        
         if self.use_distillation:
             # KL散度损失（知识蒸馏）
             try:
@@ -254,40 +307,69 @@ class DraftModelTrainer:
                 print(f"\n⚠ 警告: 计算KL loss时出错: {e}，仅使用CE loss")
                 kl_loss = torch.tensor(0.0, device=self.device)
             
-            # 交叉熵损失
+            # 交叉熵损失（对换行符应用权重惩罚）
+            # 创建权重张量
+            target_ids = inputs['input_ids'][:, 1:].reshape(-1)  # (batch * seq)
+            weights = torch.ones_like(target_ids, dtype=torch.float32, device=self.device)
+            
+            # 对换行符token应用降低的权重
+            if self.newline_token_ids:
+                for nl_id in self.newline_token_ids:
+                    if nl_id < draft_logits.size(-1):
+                        weights[target_ids == nl_id] = self.newline_token_weight
+            
+            # 使用加权交叉熵损失
             ce_loss = F.cross_entropy(
                 draft_logits[:, :-1, :].reshape(-1, draft_logits.size(-1)),
-                inputs['input_ids'][:, 1:].reshape(-1),
-                ignore_index=self.tokenizer.pad_token_id
+                target_ids,
+                weight=None,  # 不使用全局权重，而是手动应用
+                ignore_index=self.tokenizer.pad_token_id,
+                reduction='none'  # 先不reduce，手动应用权重
             )
+            # 应用权重
+            ce_loss = (ce_loss * weights).mean()
             
             # 检查CE loss是否为NaN
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
                 print(f"\n⚠ 警告: CE loss为NaN/Inf")
                 ce_loss = torch.tensor(10.0, device=self.device, requires_grad=True)
             
-            # 组合损失（添加接受概率损失）
+            # 组合损失（添加接受概率损失和注意力对齐损失）
             # 归一化权重：确保总权重不超过1
-            total_weight = self.kl_weight + (1 - self.kl_weight) + self.acceptance_weight
+            total_weight = self.kl_weight + (1 - self.kl_weight) + self.acceptance_weight + self.alignment_weight
             if total_weight > 1.0:
                 # 如果总权重超过1，按比例缩放
                 scale = 1.0 / total_weight
                 kl_w = self.kl_weight * scale
                 ce_w = (1 - self.kl_weight) * scale
                 acc_w = self.acceptance_weight * scale
+                align_w = self.alignment_weight * scale
             else:
                 kl_w = self.kl_weight
                 ce_w = (1 - self.kl_weight)
                 acc_w = self.acceptance_weight
+                align_w = self.alignment_weight
             
-            total_loss = kl_w * kl_loss + ce_w * ce_loss + acc_w * acceptance_loss
+            total_loss = kl_w * kl_loss + ce_w * ce_loss + acc_w * acceptance_loss + align_w * alignment_loss
         else:
-            # 仅使用交叉熵损失
+            # 仅使用交叉熵损失（对换行符应用权重惩罚）
+            target_ids = inputs['input_ids'][:, 1:].reshape(-1)
+            weights = torch.ones_like(target_ids, dtype=torch.float32, device=self.device)
+            
+            # 对换行符token应用降低的权重
+            if self.newline_token_ids:
+                for nl_id in self.newline_token_ids:
+                    if nl_id < draft_logits.size(-1):
+                        weights[target_ids == nl_id] = self.newline_token_weight
+            
             total_loss = F.cross_entropy(
                 draft_logits[:, :-1, :].reshape(-1, draft_logits.size(-1)),
-                inputs['input_ids'][:, 1:].reshape(-1),
-                ignore_index=self.tokenizer.pad_token_id
+                target_ids,
+                ignore_index=self.tokenizer.pad_token_id,
+                reduction='none'
             )
+            # 应用权重
+            total_loss = (total_loss * weights).mean()
             
             # 检查loss是否为NaN
             if torch.isnan(total_loss) or torch.isinf(total_loss):

@@ -459,7 +459,8 @@ class Qwen3DraftModel(nn.Module):
         return {
             'logits': logits,
             'hidden_states': hidden_states,
-            'sampled_indices': self.sampled_indices
+            'sampled_indices': self.sampled_indices,
+            'attentions': kwargs.get('output_attentions', False)  # 支持输出attention
         }
     
     @torch.no_grad()

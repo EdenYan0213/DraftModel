@@ -37,4 +37,6 @@ training:
   use_knowledge_distillation: true
   kl_divergence_weight: 0.8
   acceptance_loss_weight: 0.3  # 接受概率损失权重（方案A：优化接受率）
+  alignment_loss_weight: 0.2  # 注意力引导的对齐损失权重（新增：基于attention的分布对齐）
+  newline_token_weight: 0.3  # 换行符token权重（降低换行符在训练中的重要性，防止模型过度学习换行符）
 

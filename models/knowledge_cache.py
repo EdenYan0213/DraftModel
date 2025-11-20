@@ -20,20 +20,23 @@ class KnowledgeCacheManager:
     """知识缓存管理器 - 存储和检索常见问题的KV矩阵"""
     
     def __init__(self, hidden_size: int, num_heads: int, cache_dim: int = 512, 
-                 use_vector_retrieval: bool = True, embedding_model_name: str = None):
+                 use_vector_retrieval: bool = True, embedding_model_name: str = None,
+                 target_model: Optional[nn.Module] = None, tokenizer = None):
         """
         Args:
             hidden_size: 隐藏层维度
             num_heads: 注意力头数
             cache_dim: 缓存维度（用于压缩存储）
             use_vector_retrieval: 是否使用向量检索（默认True）
-            embedding_model_name: embedding模型名称（默认使用中文模型）
+            embedding_model_name: embedding模型名称（已废弃，现在使用target_model的嵌入层）
+            target_model: 目标模型（用于使用其embed_tokens进行检索）
+            tokenizer: tokenizer（用于tokenize文本）
         """
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
         self.cache_dim = cache_dim
-        self.use_vector_retrieval = use_vector_retrieval and SENTENCE_TRANSFORMERS_AVAILABLE
+        self.use_vector_retrieval = use_vector_retrieval
         
         # 存储缓存的KV矩阵
         # key: 问题/主题标识, value: (keys, values) 元组
@@ -43,26 +46,42 @@ class KnowledgeCacheManager:
         self.compressed_cache: Dict[str, torch.Tensor] = {}
         
         # 向量检索相关
-        self.knowledge_embeddings: Dict[str, np.ndarray] = {}  # 存储知识项的向量
-        self.embedding_model = None
+        # 注意：embeddings应该基于KV矩阵，而不是hidden states
+        # 使用KV矩阵的完整序列进行检索，不进行池化
+        self.knowledge_embeddings: Dict[str, torch.Tensor] = {}  # 存储知识项的完整KV序列 (num_heads, seq_len, head_dim) 或 (seq_len, hidden_size)
+        self.embedding_model = None  # 外部embedding模型（已废弃）
+        self.target_model = target_model  # 目标模型（用于使用其嵌入层）
+        self.tokenizer = tokenizer  # tokenizer
         
-        if self.use_vector_retrieval:
+        # 优先使用目标模型的嵌入层
+        if target_model is not None and tokenizer is not None:
+            # 检查是否有embed_tokens
+            if hasattr(target_model, 'model') and hasattr(target_model.model, 'embed_tokens'):
+                self.use_vector_retrieval = use_vector_retrieval
+                print("✓ 使用目标模型的嵌入层进行向量检索")
+            elif hasattr(target_model, 'embed_tokens'):
+                self.use_vector_retrieval = use_vector_retrieval
+                print("✓ 使用目标模型的嵌入层进行向量检索")
+            else:
+                print("⚠ 警告: 目标模型没有embed_tokens，回退到字符串匹配检索")
+                self.use_vector_retrieval = False
+        elif use_vector_retrieval and SENTENCE_TRANSFORMERS_AVAILABLE:
+            # 回退到外部embedding模型（不推荐，但保持兼容性）
             try:
-                # 使用中文embedding模型（如果没有指定，使用轻量级模型）
                 if embedding_model_name is None:
-                    # 使用轻量级中文模型
                     embedding_model_name = 'paraphrase-multilingual-MiniLM-L12-v2'
-                    # 如果上面的模型不可用，尝试其他模型
-                    # embedding_model_name = 'sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2'
                 
-                print(f"加载embedding模型: {embedding_model_name}")
+                print(f"⚠ 警告: 未提供target_model，使用外部embedding模型: {embedding_model_name}")
+                print("   建议: 使用target_model的嵌入层以保持一致性")
                 self.embedding_model = SentenceTransformer(embedding_model_name)
-                print("✓ Embedding模型加载完成")
+                print("✓ 外部Embedding模型加载完成")
             except Exception as e:
                 print(f"⚠ 警告: 无法加载embedding模型 {embedding_model_name}: {e}")
                 print("  将回退到字符串匹配检索")
                 self.use_vector_retrieval = False
                 self.embedding_model = None
+        else:
+            self.use_vector_retrieval = False
         
         # KV投影层（用于压缩和解压缩）
         self.kv_compressor = nn.Sequential(
@@ -101,12 +120,75 @@ class KnowledgeCacheManager:
         self.kv_cache[key] = (keys.clone(), values.clone())
         
         # 计算并存储embedding（用于向量检索）
-        if self.use_vector_retrieval and self.embedding_model is not None:
+        # 注意：embeddings应该基于KV矩阵，而不是hidden states
+        # 但为了检索，我们需要一个查询表示，这里使用KV矩阵的平均值
+        if self.use_vector_retrieval:
             try:
-                embedding = self.embedding_model.encode(key, convert_to_numpy=True)
-                self.knowledge_embeddings[key] = embedding
+                # 使用KV矩阵计算检索用的embedding
+                # KV矩阵已经存储在self.kv_cache中，格式: (num_heads, seq_len, head_dim)
+                if key in self.kv_cache:
+                    cached_keys, cached_values = self.kv_cache[key]
+                    
+                    # 将KV矩阵转换为用于检索的表示
+                    # 方法：将(num_heads, seq_len, head_dim) reshape为(seq_len, hidden_size)
+                    # 然后保存完整序列，不池化
+                    if cached_keys.dim() == 3:
+                        # (num_heads, seq_len, head_dim) -> (seq_len, num_heads, head_dim) -> (seq_len, hidden_size)
+                        seq_len = cached_keys.shape[1]
+                        # 转置并reshape: (num_heads, seq_len, head_dim) -> (seq_len, hidden_size)
+                        keys_reshaped = cached_keys.transpose(0, 1).contiguous()  # (seq_len, num_heads, head_dim)
+                        keys_reshaped = keys_reshaped.view(seq_len, -1)  # (seq_len, hidden_size)
+                        
+                        # 同样处理values
+                        values_reshaped = cached_values.transpose(0, 1).contiguous()
+                        values_reshaped = values_reshaped.view(seq_len, -1)
+                        
+                        # 保存KV矩阵的完整序列（用于检索）
+                        # 使用keys和values的平均作为检索表示，或者分别保存
+                        # 这里使用keys作为主要检索表示（因为keys包含查询信息）
+                        self.knowledge_embeddings[key] = keys_reshaped.cpu()  # (seq_len, hidden_size)
+                    else:
+                        # 如果已经是(seq_len, hidden_size)格式，直接保存
+                        self.knowledge_embeddings[key] = cached_keys.cpu()
+                elif self.target_model is not None and self.tokenizer is not None:
+                    # 如果没有KV缓存，使用模型生成KV矩阵
+                    input_ids = self.tokenizer(key, return_tensors="pt", padding=False, truncation=True, max_length=512)
+                    device = next(self.target_model.parameters()).device
+                    input_ids_tensor = input_ids['input_ids'].to(device)
+                    attention_mask = input_ids.get('attention_mask', None)
+                    if attention_mask is not None:
+                        attention_mask = attention_mask.to(device)
+                    
+                    with torch.no_grad():
+                        # 获取模型的KV矩阵（最后一层Attention的KV）
+                        outputs = self.target_model(input_ids=input_ids_tensor, attention_mask=attention_mask, 
+                                                   use_cache=True, output_attentions=False)
+                        
+                        # 从past_key_values提取最后一层的KV
+                        if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
+                            last_layer_kv = outputs.past_key_values[-1]  # 最后一层
+                            k, v = last_layer_kv
+                            # k, v: (batch, num_heads, seq_len, head_dim)
+                            k = k.squeeze(0)  # (num_heads, seq_len, head_dim)
+                            
+                            # 转换为(seq_len, hidden_size)格式
+                            seq_len = k.shape[1]
+                            k_reshaped = k.transpose(0, 1).contiguous().view(seq_len, -1)  # (seq_len, hidden_size)
+                            
+                            # 保存完整序列
+                            self.knowledge_embeddings[key] = k_reshaped.cpu()
+                        else:
+                            print(f"警告: 无法从模型提取KV矩阵 ({key[:30]}...)")
+                elif self.embedding_model is not None:
+                    # 回退到外部embedding模型
+                    embedding = self.embedding_model.encode(key, convert_to_numpy=True)
+                    self.knowledge_embeddings[key] = embedding
+                else:
+                    print(f"警告: 无法计算embedding，未提供target_model或embedding_model")
             except Exception as e:
                 print(f"警告: 计算embedding失败 ({key[:30]}...): {e}")
+                import traceback
+                traceback.print_exc()
         
         # 压缩存储（可选）
         if compress:
@@ -157,10 +239,12 @@ class KnowledgeCacheManager:
             (keys, values) 元组，如果未找到返回None
         """
         # 优先使用向量检索
-        if self.use_vector_retrieval and self.embedding_model is not None and self.knowledge_embeddings:
-            result = self.retrieve_by_similarity(query, topk=topk, threshold=threshold)
-            if result is not None:
-                return result
+        if self.use_vector_retrieval and self.knowledge_embeddings:
+            # 检查是否有target_model或embedding_model
+            if (self.target_model is not None and self.tokenizer is not None) or self.embedding_model is not None:
+                result = self.retrieve_by_similarity(query, topk=topk, threshold=threshold)
+                if result is not None:
+                    return result
         
         # 回退到字符串匹配
         return self.retrieve_by_string_match(query)
@@ -181,14 +265,60 @@ class KnowledgeCacheManager:
             return None
         
         try:
-            # 计算查询的embedding
-            query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
+            # 计算查询的KV矩阵（与知识缓存使用相同的表示）
+            # 使用最后一层Attention的KV矩阵，不池化，保留完整序列
+            if self.target_model is not None and self.tokenizer is not None:
+                # 使用目标模型获取KV矩阵（最后一层Attention的KV）
+                input_ids = self.tokenizer(query, return_tensors="pt", padding=False, truncation=True, max_length=512)
+                device = next(self.target_model.parameters()).device
+                input_ids_tensor = input_ids['input_ids'].to(device)
+                attention_mask = input_ids.get('attention_mask', None)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                
+                with torch.no_grad():
+                    # 获取模型的KV矩阵
+                    outputs = self.target_model(input_ids=input_ids_tensor, attention_mask=attention_mask, 
+                                               use_cache=True, output_attentions=False)
+                    
+                    # 从past_key_values提取最后一层的KV
+                    if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
+                        last_layer_kv = outputs.past_key_values[-1]  # 最后一层
+                        k, v = last_layer_kv
+                        # k: (batch, num_heads, seq_len, head_dim)
+                        k = k.squeeze(0)  # (num_heads, seq_len, head_dim)
+                        
+                        # 转换为(seq_len, hidden_size)格式，与知识缓存保持一致
+                        seq_len = k.shape[1]
+                        query_kv_sequence = k.transpose(0, 1).contiguous().view(seq_len, -1).cpu()  # (seq_len, hidden_size)
+                    else:
+                        raise ValueError("无法从模型提取KV矩阵")
+            elif self.embedding_model is not None:
+                # 回退到外部embedding模型（不推荐）
+                query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
+                # 转换为torch tensor以保持一致性
+                query_kv_sequence = torch.from_numpy(query_embedding).unsqueeze(0)  # (1, embedding_dim)
+            else:
+                return None
             
-            # 计算与所有知识项的相似度
+            # 计算与所有知识项的相似度（使用完整序列，不池化）
             similarities = []
-            for key, emb in self.knowledge_embeddings.items():
-                # 计算余弦相似度
-                similarity = self._cosine_similarity(query_embedding, emb)
+            
+            # 使用完整KV序列计算相似度
+            for key, cached_kv_seq in self.knowledge_embeddings.items():
+                # cached_kv_seq: (seq_len_cached, hidden_size) - 完整序列
+                # query_kv_sequence: (seq_len_query, hidden_size) - 完整序列
+                
+                # 计算序列级相似度（不池化）
+                # 方法：计算两个序列的平均向量的相似度
+                # 注意：虽然计算平均，但我们保存的是完整序列，可以根据需要改进
+                query_mean = query_kv_sequence.mean(dim=0).numpy()  # (hidden_size,)
+                cached_mean = cached_kv_seq.mean(dim=0).numpy()  # (hidden_size,)
+                similarity = self._cosine_similarity(query_mean, cached_mean)
+                
+                # 未来可以改进：使用DTW（动态时间规整）或其他序列对齐方法
+                # 或者使用注意力机制计算序列对齐相似度
+                
                 if similarity >= threshold:
                     similarities.append((key, similarity))
             
@@ -334,7 +464,60 @@ class KnowledgeCacheManager:
     
     def get_retrieval_method(self) -> str:
         """返回当前使用的检索方法"""
-        if self.use_vector_retrieval and self.embedding_model is not None:
-            return "vector_similarity"
+        if self.use_vector_retrieval:
+            if self.target_model is not None:
+                return "vector_similarity (target_model hidden_states)"
+            elif self.embedding_model is not None:
+                return "vector_similarity (external embedding model)"
         return "string_match"
+    
+    def _recompute_all_embeddings(self):
+        """重新计算所有知识项的embeddings（当维度不匹配时）"""
+        if not (self.target_model is not None and self.tokenizer is not None):
+            print("⚠ 警告: 无法重新计算embeddings，未提供target_model和tokenizer")
+            return
+        
+        print(f"重新计算 {len(self.kv_cache)} 个知识项的embeddings（使用KV矩阵）...")
+        keys_to_recompute = list(self.kv_cache.keys())
+        device = next(self.target_model.parameters()).device
+        
+        for key in keys_to_recompute:
+            try:
+                # 使用与add_knowledge相同的方法重新计算
+                input_ids = self.tokenizer(key, return_tensors="pt", padding=True, truncation=True, max_length=512)
+                input_ids_tensor = input_ids['input_ids'].to(device)
+                attention_mask = input_ids.get('attention_mask', None)
+                if attention_mask is not None:
+                    attention_mask = attention_mask.to(device)
+                
+                with torch.no_grad():
+                    # 使用KV矩阵重新计算（与add_knowledge保持一致）
+                    # 优先使用已有的KV缓存
+                    if key in self.kv_cache:
+                        cached_keys, cached_values = self.kv_cache[key]
+                        
+                        # 将KV矩阵转换为(seq_len, hidden_size)格式
+                        if cached_keys.dim() == 3:
+                            seq_len = cached_keys.shape[1]
+                            keys_reshaped = cached_keys.transpose(0, 1).contiguous().view(seq_len, -1)
+                            self.knowledge_embeddings[key] = keys_reshaped.cpu()
+                        else:
+                            self.knowledge_embeddings[key] = cached_keys.cpu()
+                    else:
+                        # 如果没有KV缓存，从模型生成KV矩阵
+                        outputs = self.target_model(input_ids=input_ids_tensor, attention_mask=attention_mask, 
+                                                   use_cache=True, output_attentions=False)
+                        
+                        if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
+                            last_layer_kv = outputs.past_key_values[-1]
+                            k, v = last_layer_kv
+                            k = k.squeeze(0)
+                            
+                            seq_len = k.shape[1]
+                            k_reshaped = k.transpose(0, 1).contiguous().view(seq_len, -1)
+                            self.knowledge_embeddings[key] = k_reshaped.cpu()
+            except Exception as e:
+                print(f"警告: 重新计算embedding失败 ({key[:30]}...): {e}")
+        
+        print(f"✓ 重新计算完成，共 {len(self.knowledge_embeddings)} 个embeddings")
 

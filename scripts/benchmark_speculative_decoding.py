@@ -54,7 +54,9 @@ def load_models(config_path: str, checkpoint_path: str = None):
             num_heads=config['base_model']['num_attention_heads'],
             cache_dim=config['knowledge_enhancement']['cache_dim'],
             use_vector_retrieval=use_vector_retrieval,
-            embedding_model_name=embedding_model_name
+            embedding_model_name=embedding_model_name,
+            target_model=target_model,  # 使用目标模型的嵌入层
+            tokenizer=tokenizer  # 传入tokenizer
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
         

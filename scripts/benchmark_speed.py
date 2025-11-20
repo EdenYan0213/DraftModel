@@ -107,7 +107,9 @@ def main():
         knowledge_cache_manager = KnowledgeCacheManager(
             hidden_size=config['base_model']['hidden_size'],
             num_heads=config['base_model']['num_attention_heads'],
-            cache_dim=config['knowledge_enhancement']['cache_dim']
+            cache_dim=config['knowledge_enhancement']['cache_dim'],
+            target_model=target_model,  # 使用目标模型的嵌入层
+            tokenizer=tokenizer  # 传入tokenizer
         )
         knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
         knowledge_cache_manager.compressed_cache = cache_data.get('compressed_cache', {})
