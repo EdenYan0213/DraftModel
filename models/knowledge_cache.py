@@ -5,7 +5,7 @@
 
 import torch
 import torch.nn as nn
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 import numpy as np
 from collections import defaultdict
 
@@ -49,6 +49,7 @@ class KnowledgeCacheManager:
         # 注意：embeddings应该基于KV矩阵，而不是hidden states
         # 使用KV矩阵的完整序列进行检索，不进行池化
         self.knowledge_embeddings: Dict[str, torch.Tensor] = {}  # 存储知识项的完整KV序列 (num_heads, seq_len, head_dim) 或 (seq_len, hidden_size)
+        self.answer_start_indices: Dict[str, int] = {}  # 记录每个知识项的答案起始位置
         self.embedding_model = None  # 外部embedding模型（已废弃）
         self.target_model = target_model  # 目标模型（用于使用其嵌入层）
         self.tokenizer = tokenizer  # tokenizer
@@ -100,7 +101,8 @@ class KnowledgeCacheManager:
                       key: str, 
                       keys: torch.Tensor, 
                       values: torch.Tensor,
-                      compress: bool = True):
+                      compress: bool = True,
+                      answer_start_idx: Optional[int] = None):
         """
         添加知识到缓存
         
@@ -118,6 +120,10 @@ class KnowledgeCacheManager:
         
         # 存储原始KV
         self.kv_cache[key] = (keys.clone(), values.clone())
+        
+        # 记录答案起始位置（如果提供）
+        if answer_start_idx is not None:
+            self.answer_start_indices[key] = answer_start_idx
         
         # 计算并存储embedding（用于向量检索）
         # 注意：embeddings应该基于KV矩阵，而不是hidden states
@@ -226,7 +232,7 @@ class KnowledgeCacheManager:
                 print(f"警告: 压缩知识缓存失败 ({key[:30]}...): {e}")
                 pass
 
-    def retrieve(self, query: str, topk: int = 1, threshold: float = 0.5) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def retrieve(self, query: str, topk: int = 1, threshold: float = 0.5, return_similarity: bool = False) -> Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor, float, int], Tuple[torch.Tensor, torch.Tensor, int]]]:
         """
         检索知识KV矩阵（优先使用向量检索，失败时回退到字符串匹配）
         
@@ -234,22 +240,40 @@ class KnowledgeCacheManager:
             query: 查询文本
             topk: 返回top-k个最相关的知识（当前实现只返回top-1）
             threshold: 相似度阈值（0-1），低于此阈值不返回
+            return_similarity: 是否返回相似度分数
         
         Returns:
-            (keys, values) 元组，如果未找到返回None
+            (keys, values) 元组，如果return_similarity=True，返回(keys, values, similarity)
+            如果未找到返回None
         """
         # 优先使用向量检索
         if self.use_vector_retrieval and self.knowledge_embeddings:
             # 检查是否有target_model或embedding_model
             if (self.target_model is not None and self.tokenizer is not None) or self.embedding_model is not None:
-                result = self.retrieve_by_similarity(query, topk=topk, threshold=threshold)
+                result = self.retrieve_by_similarity(query, topk=topk, threshold=threshold, return_similarity=return_similarity)
                 if result is not None:
                     return result
         
         # 回退到字符串匹配
-        return self.retrieve_by_string_match(query)
+        result = self.retrieve_by_string_match(query)
+        if result is not None:
+            # 查找答案起始位置
+            answer_start_idx = None
+            for key in self.kv_cache.keys():
+                if query in key or key in query:
+                    answer_start_idx = self.answer_start_indices.get(key, None)
+                    break
+            
+            if return_similarity:
+                # 字符串匹配时，假设相似度为0.8（完全匹配）
+                if answer_start_idx is not None:
+                    return (*result, 0.8, answer_start_idx)
+                return (*result, 0.8)
+            elif answer_start_idx is not None:
+                return (*result, answer_start_idx)
+        return result
     
-    def retrieve_by_similarity(self, query: str, topk: int = 1, threshold: float = 0.5) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    def retrieve_by_similarity(self, query: str, topk: int = 1, threshold: float = 0.5, return_similarity: bool = False) -> Optional[Union[Tuple[torch.Tensor, torch.Tensor], Tuple[torch.Tensor, torch.Tensor, float], Tuple[torch.Tensor, torch.Tensor, float, int], Tuple[torch.Tensor, torch.Tensor, int]]]:
         """
         基于向量相似度检索知识
         
@@ -265,10 +289,10 @@ class KnowledgeCacheManager:
             return None
         
         try:
-            # 计算查询的KV矩阵（与知识缓存使用相同的表示）
-            # 使用最后一层Attention的KV矩阵，不池化，保留完整序列
+            # 计算查询的语义表示（使用目标模型的hidden states）
+            # 使用最后一层的hidden states，这是最语义丰富的表示
             if self.target_model is not None and self.tokenizer is not None:
-                # 使用目标模型获取KV矩阵（最后一层Attention的KV）
+                # 使用目标模型获取hidden states（最后一层的输出）
                 input_ids = self.tokenizer(query, return_tensors="pt", padding=False, truncation=True, max_length=512)
                 device = next(self.target_model.parameters()).device
                 input_ids_tensor = input_ids['input_ids'].to(device)
@@ -277,44 +301,57 @@ class KnowledgeCacheManager:
                     attention_mask = attention_mask.to(device)
                 
                 with torch.no_grad():
-                    # 获取模型的KV矩阵
+                    # 获取模型的hidden states（语义表示）
                     outputs = self.target_model(input_ids=input_ids_tensor, attention_mask=attention_mask, 
-                                               use_cache=True, output_attentions=False)
+                                               output_hidden_states=True)
                     
-                    # 从past_key_values提取最后一层的KV
-                    if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
-                        last_layer_kv = outputs.past_key_values[-1]  # 最后一层
-                        k, v = last_layer_kv
-                        # k: (batch, num_heads, seq_len, head_dim)
-                        k = k.squeeze(0)  # (num_heads, seq_len, head_dim)
-                        
-                        # 转换为(seq_len, hidden_size)格式，与知识缓存保持一致
-                        seq_len = k.shape[1]
-                        query_kv_sequence = k.transpose(0, 1).contiguous().view(seq_len, -1).cpu()  # (seq_len, hidden_size)
+                    # 从hidden_states提取最后一层的输出（最语义丰富的表示）
+                    if hasattr(outputs, 'hidden_states') and outputs.hidden_states:
+                        last_hidden_states = outputs.hidden_states[-1]  # 最后一层: (batch, seq_len, hidden_size)
+                        last_hidden_states = last_hidden_states.squeeze(0)  # (seq_len, hidden_size)
+                        query_semantic_sequence = last_hidden_states.cpu()  # (seq_len, hidden_size)
                     else:
-                        raise ValueError("无法从模型提取KV矩阵")
+                        # 回退到KV矩阵（如果hidden_states不可用）
+                        if hasattr(outputs, 'past_key_values') and outputs.past_key_values:
+                            last_layer_kv = outputs.past_key_values[-1]  # 最后一层
+                            k, v = last_layer_kv
+                            k = k.squeeze(0)  # (num_heads, seq_len, head_dim)
+                            seq_len = k.shape[1]
+                            query_semantic_sequence = k.transpose(0, 1).contiguous().view(seq_len, -1).cpu()  # (seq_len, hidden_size)
+                        else:
+                            raise ValueError("无法从模型提取语义表示")
             elif self.embedding_model is not None:
                 # 回退到外部embedding模型（不推荐）
                 query_embedding = self.embedding_model.encode(query, convert_to_numpy=True)
                 # 转换为torch tensor以保持一致性
-                query_kv_sequence = torch.from_numpy(query_embedding).unsqueeze(0)  # (1, embedding_dim)
+                query_semantic_sequence = torch.from_numpy(query_embedding).unsqueeze(0)  # (1, embedding_dim)
             else:
                 return None
             
-            # 计算与所有知识项的相似度（使用完整序列，不池化）
+            # 计算与所有知识项的语义相似度（使用完整序列的平均表示）
             similarities = []
             
-            # 使用完整KV序列计算相似度
-            for key, cached_kv_seq in self.knowledge_embeddings.items():
-                # cached_kv_seq: (seq_len_cached, hidden_size) - 完整序列
-                # query_kv_sequence: (seq_len_query, hidden_size) - 完整序列
+            # 使用完整语义序列计算相似度
+            for key, cached_semantic_seq in self.knowledge_embeddings.items():
+                # cached_semantic_seq: (seq_len_cached, hidden_size) - 完整序列的语义表示
+                # query_semantic_sequence: (seq_len_query, hidden_size) - 完整序列的语义表示
                 
-                # 计算序列级相似度（不池化）
-                # 方法：计算两个序列的平均向量的相似度
-                # 注意：虽然计算平均，但我们保存的是完整序列，可以根据需要改进
-                query_mean = query_kv_sequence.mean(dim=0).numpy()  # (hidden_size,)
-                cached_mean = cached_kv_seq.mean(dim=0).numpy()  # (hidden_size,)
-                similarity = self._cosine_similarity(query_mean, cached_mean)
+                # 计算语义级相似度
+                # 方法：计算两个序列的平均向量的余弦相似度（语义级）
+                # 使用平均池化得到句子级语义表示，然后计算余弦相似度
+                if isinstance(query_semantic_sequence, torch.Tensor):
+                    query_semantic_mean = query_semantic_sequence.mean(dim=0).numpy()  # (hidden_size,)
+                else:
+                    query_semantic_mean = query_semantic_sequence  # 已经是numpy数组
+                
+                if isinstance(cached_semantic_seq, torch.Tensor):
+                    cached_semantic_mean = cached_semantic_seq.mean(dim=0).numpy()  # (hidden_size,)
+                else:
+                    cached_semantic_mean = cached_semantic_seq.mean(axis=0) if hasattr(cached_semantic_seq, 'mean') else cached_semantic_seq
+                    if isinstance(cached_semantic_mean, torch.Tensor):
+                        cached_semantic_mean = cached_semantic_mean.numpy()
+                
+                similarity = self._cosine_similarity(query_semantic_mean, cached_semantic_mean)
                 
                 # 未来可以改进：使用DTW（动态时间规整）或其他序列对齐方法
                 # 或者使用注意力机制计算序列对齐相似度
@@ -330,12 +367,16 @@ class KnowledgeCacheManager:
             
             # 返回最相似的知识项
             best_key = similarities[0][0]
+            best_similarity = similarities[0][1]
             keys, values = self.kv_cache[best_key]
+            answer_start_idx = self.answer_start_indices.get(best_key, None)
             
             if len(similarities) > 1:
-                print(f"检索: '{query[:30]}...' -> '{best_key[:30]}...' (相似度: {similarities[0][1]:.3f})")
+                print(f"检索: '{query[:30]}...' -> '{best_key[:30]}...' (相似度: {best_similarity:.3f})")
             
-            return keys, values
+            if return_similarity:
+                return keys, values, best_similarity, answer_start_idx
+            return keys, values, answer_start_idx
             
         except Exception as e:
             print(f"警告: 向量检索失败: {e}，回退到字符串匹配")

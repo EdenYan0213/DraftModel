@@ -83,6 +83,11 @@ def main():
             knowledge_cache_manager.knowledge_embeddings = cache_data['knowledge_embeddings']
             print(f"✓ 已恢复 {len(knowledge_cache_manager.knowledge_embeddings)} 个知识项的embeddings")
         
+        # 恢复答案起始位置（如果存在）
+        if 'answer_start_indices' in cache_data:
+            knowledge_cache_manager.answer_start_indices = cache_data['answer_start_indices']
+            print(f"✓ 已恢复 {len(knowledge_cache_manager.answer_start_indices)} 个知识项的答案起始位置")
+        
         # 恢复压缩/解压缩器（如果保存了）
         if 'compressor_state' in cache_data:
             knowledge_cache_manager.kv_compressor.load_state_dict(cache_data['compressor_state'])

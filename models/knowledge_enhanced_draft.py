@@ -10,11 +10,14 @@ from .layer_sampler import LayerSampler
 class KnowledgeEnhancedCrossAttention(nn.Module):
     """知识增强的交叉注意力层 - 使用缓存的KV矩阵"""
     
-    def __init__(self, hidden_size: int, num_heads: int, cache_dim: int = 512):
+    def __init__(self, hidden_size: int, num_heads: int, cache_dim: int = 512, 
+                 question_weight: float = 0.3, answer_weight: float = 1.0):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
         self.head_dim = hidden_size // num_heads
+        self.question_weight = question_weight  # 问题部分权重
+        self.answer_weight = answer_weight      # 答案部分权重
         
         # 知识交叉注意力
         self.knowledge_attn = nn.MultiheadAttention(
@@ -31,9 +34,17 @@ class KnowledgeEnhancedCrossAttention(nn.Module):
             nn.Linear(hidden_size * 2, hidden_size * 2)
         )
         
-        # 门控融合机制
+        # 门控融合机制（改进版：考虑知识置信度）
         self.fusion_gate = nn.Sequential(
             nn.Linear(hidden_size * 2, hidden_size),
+            nn.Sigmoid()
+        )
+        
+        # 知识置信度网络（评估知识输出的可靠性）
+        self.knowledge_confidence = nn.Sequential(
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
             nn.Sigmoid()
         )
         
@@ -45,7 +56,12 @@ class KnowledgeEnhancedCrossAttention(nn.Module):
                 knowledge_keys: Optional[torch.Tensor] = None,
                 knowledge_values: Optional[torch.Tensor] = None,
                 knowledge_cache: Optional[torch.Tensor] = None,
-                attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+                attention_mask: Optional[torch.Tensor] = None,
+                knowledge_similarity: Optional[float] = None,
+                force_knowledge_weight: Optional[float] = None,
+                current_answer_length: Optional[int] = None,
+                answer_start_idx: Optional[int] = None,
+                query_length: Optional[int] = None) -> torch.Tensor:
         """
         前向传播
         
@@ -128,14 +144,138 @@ class KnowledgeEnhancedCrossAttention(nn.Module):
                 else:
                     raise ValueError(f"无法处理knowledge_keys形状: {knowledge_keys.shape}")
             
-            # 使用缓存的KV矩阵进行交叉注意力
-            # Q = hidden_states (Self-Attention的输出)
-            # K, V = knowledge_keys, knowledge_values (缓存的KV)
+            # 优化：使用问题+答案的完整KV，使用动态加权mask策略
+            # 这样Query和Key的语义上下文匹配（都包含问题）
+            aligned_keys = knowledge_keys
+            aligned_values = knowledge_values
+            
+            # 优化Mask策略2：使用动态加权mask
+            # 根据生成阶段动态调整问题部分权重：
+            # - 生成初期（前20%）：问题权重0.5（保留更多上下文）
+            # - 生成后期：问题权重0.2（更关注答案）
+            # 这样既保留了问题的上下文信息，又重点关注答案部分
+            attn_mask = None
+            if answer_start_idx is not None and answer_start_idx > 0:
+                # 获取KV序列长度
+                if knowledge_keys.dim() == 3:
+                    # (num_heads, seq_len, head_dim)
+                    kv_seq_len = knowledge_keys.shape[1]
+                elif knowledge_keys.dim() == 2:
+                    # (seq_len, hidden_size)
+                    kv_seq_len = knowledge_keys.shape[0]
+                elif knowledge_keys.dim() == 4:
+                    # (batch, num_heads, seq_len, head_dim)
+                    kv_seq_len = knowledge_keys.shape[2]
+                else:
+                    kv_seq_len = knowledge_keys.shape[-2] if knowledge_keys.dim() > 1 else 1
+                
+                # 创建加权mask：问题部分权重0.3，答案部分权重1.0
+                # 使用attention mask而非key_padding_mask，因为我们需要加权而非完全屏蔽
+                if answer_start_idx < kv_seq_len:
+                    # 创建attention mask: (seq_len, seq_len)
+                    # 对于每个query位置，对key的问题部分应用较低权重
+                    # 由于MultiheadAttention不支持直接加权mask，我们使用以下策略：
+                    # 1. 在计算attention之前，对问题部分的key进行缩放
+                    # 2. 或者使用key_padding_mask但配合权重调整
+                    
+                    # 优化：基于相似度和生成阶段的动态mask策略
+                    # 1. 根据知识相似度确定权重范围
+                    # 2. 根据生成阶段在范围内动态调整
+                    
+                    # 步骤1：根据知识相似度确定权重范围（优化版：更细粒度）
+                    if knowledge_similarity is not None:
+                        if knowledge_similarity > 0.85:
+                            # 极高相似度：更关注答案（0.3 → 0.05）
+                            weight_start = 0.3
+                            weight_end = 0.05
+                            weight_range = weight_start - weight_end  # 0.25
+                        elif knowledge_similarity > 0.7:
+                            # 高相似度：更关注答案（0.4 → 0.1）
+                            weight_start = 0.4
+                            weight_end = 0.1
+                            weight_range = weight_start - weight_end  # 0.3
+                        elif knowledge_similarity > 0.5:
+                            # 中等相似度：平衡（0.5 → 0.2）
+                            weight_start = 0.5
+                            weight_end = 0.2
+                            weight_range = weight_start - weight_end  # 0.3
+                        elif knowledge_similarity > 0.3:
+                            # 低相似度：保留更多问题信息（0.6 → 0.3）
+                            weight_start = 0.6
+                            weight_end = 0.3
+                            weight_range = weight_start - weight_end  # 0.3
+                        else:
+                            # 极低相似度：保留更多问题信息（0.7 → 0.4）
+                            weight_start = 0.7
+                            weight_end = 0.4
+                            weight_range = weight_start - weight_end  # 0.3
+                    else:
+                        # 无相似度信息：使用默认范围（0.5 → 0.2）
+                        weight_start = 0.5
+                        weight_end = 0.2
+                        weight_range = weight_start - weight_end  # 0.3
+                    
+                    # 步骤2：根据生成阶段在范围内动态调整
+                    if query_length is not None and query_length > 0 and current_answer_length is not None:
+                        # 计算生成比例（0.0到1.0）
+                        generation_ratio = min(current_answer_length / max(query_length, 1), 1.0)
+                        # 在权重范围内线性衰减
+                        question_weight = weight_start - weight_range * generation_ratio
+                        question_weight = max(weight_end, min(weight_start, question_weight))  # 限制在范围内
+                    else:
+                        # 无生成阶段信息：使用起始权重
+                        question_weight = weight_start
+                    
+                    answer_weight = self.answer_weight     # 答案部分权重（可配置）
+                    
+                    if knowledge_keys.dim() == 3:
+                        # (num_heads, seq_len, head_dim)
+                        # 对问题部分的key和value进行缩放
+                        aligned_keys = knowledge_keys.clone()
+                        aligned_values = knowledge_values.clone()
+                        aligned_keys[:, :answer_start_idx, :] *= question_weight
+                        aligned_values[:, :answer_start_idx, :] *= question_weight
+                        # 答案部分保持原样（已经是1.0权重）
+                    elif knowledge_keys.dim() == 2:
+                        # (seq_len, hidden_size)
+                        aligned_keys = knowledge_keys.clone()
+                        aligned_values = knowledge_values.clone()
+                        aligned_keys[:answer_start_idx, :] *= question_weight
+                        aligned_values[:answer_start_idx, :] *= question_weight
+                    elif knowledge_keys.dim() == 4:
+                        # (batch, num_heads, seq_len, head_dim)
+                        aligned_keys = knowledge_keys.clone()
+                        aligned_values = knowledge_values.clone()
+                        aligned_keys[:, :, :answer_start_idx, :] *= question_weight
+                        aligned_values[:, :, :answer_start_idx, :] *= question_weight
+                    
+                    # 同时使用key_padding_mask进一步降低问题部分的影响
+                    # 但设置为False（不屏蔽），因为我们已经在权重上做了处理
+                    # 这里可以添加一个轻微的mask来进一步降低问题部分的attention
+                    # 创建soft mask：问题部分为True（轻微mask），答案部分为False
+                    # 注意：key_padding_mask中True表示需要mask的位置
+                    # 但我们可以通过设置一个非常小的mask值来实现"轻微mask"
+                    # 由于MultiheadAttention的限制，我们主要依赖权重缩放
+                    key_padding_mask = None  # 不使用完全屏蔽，只使用权重缩放
+                else:
+                    # 如果answer_start_idx >= kv_seq_len，使用完整KV
+                    aligned_keys = knowledge_keys
+                    aligned_values = knowledge_values
+                    key_padding_mask = None
+            else:
+                # 没有答案起始位置信息，使用完整KV
+                aligned_keys = knowledge_keys
+                aligned_values = knowledge_values
+                key_padding_mask = None
+            
+            # 使用加权后的KV进行交叉注意力
+            # Q = hidden_states (Self-Attention的输出，包含问题+部分生成)
+            # K, V = aligned_keys, aligned_values (加权后的完整KV：问题部分权重0.3，答案部分权重1.0)
             knowledge_output, _ = self.knowledge_attn(
-                query=hidden_states,  # Q: 当前层的输出
-                key=knowledge_keys,   # K: 缓存的Key
-                value=knowledge_values, # V: 缓存的Value
-                key_padding_mask=None,
+                query=hidden_states,  # Q: 当前层的输出（问题+部分生成）
+                key=aligned_keys,   # K: 加权后的完整KV（问题部分权重0.3，答案部分权重1.0）
+                value=aligned_values, # V: 加权后的完整KV（问题部分权重0.3，答案部分权重1.0）
+                key_padding_mask=key_padding_mask,  # 不使用完全屏蔽
                 need_weights=False
             )
         
@@ -164,10 +304,34 @@ class KnowledgeEnhancedCrossAttention(nn.Module):
             # 没有知识缓存，直接返回
             return hidden_states
         
-        # 门控融合
+        # 改进的门控融合机制（简化版：主要依赖相似度和强制权重）
         combined = torch.cat([hidden_states, knowledge_output], dim=-1)
-        gate_weights = self.fusion_gate(combined)
-        enhanced_states = gate_weights * hidden_states + (1 - gate_weights) * knowledge_output
+        base_gate_weights = self.fusion_gate(combined)  # (batch_size, seq_len, hidden_size)
+        
+        # 如果强制指定知识权重（推理时使用，优先级最高）
+        if force_knowledge_weight is not None:
+            # force_knowledge_weight 表示知识的最小权重（0-1）
+            # 例如 0.6 表示至少60%使用知识，即 gate_weights 最大为 0.4
+            max_original_weight = 1.0 - force_knowledge_weight
+            # 直接设置门控权重
+            final_gate_weights = torch.clamp(base_gate_weights, max=max_original_weight)
+        elif knowledge_similarity is not None:
+            # 根据相似度调整门控权重（不使用未训练的置信度网络）
+            # 相似度高时，更多使用知识（降低原始输出权重）
+            similarity_factor = torch.tensor(knowledge_similarity, device=base_gate_weights.device, dtype=base_gate_weights.dtype)
+            # 相似度越高，原始输出权重越低（但保持至少30%的原始输出）
+            # similarity_factor * 0.6 表示最多降低60%的原始权重
+            final_gate_weights = base_gate_weights * (0.3 + 0.4 * (1 - similarity_factor))
+        else:
+            # 没有相似度信息，使用基础门控权重
+            # 但稍微偏向知识（降低原始输出权重10%）
+            final_gate_weights = base_gate_weights * 0.9
+        
+        # 融合：更保守的策略，主要依赖原始输出，知识增强作为辅助
+        # 修改：增加原始输出的权重（从默认的gate_weights改为至少0.7），减少知识输出的权重
+        # 这样可以提高与目标模型的对齐，因为目标模型不使用知识增强
+        conservative_gate = torch.clamp(final_gate_weights, min=0.7, max=1.0)  # 至少70%使用原始输出
+        enhanced_states = conservative_gate * hidden_states + (1 - conservative_gate) * knowledge_output
         
         # 层归一化
         enhanced_states = self.layer_norm(enhanced_states)
@@ -195,8 +359,14 @@ class EnhancedDraftLayer(nn.Module):
         
         # 知识增强
         if use_knowledge_enhancement:
+            # 从配置中获取mask权重（如果可用）
+            question_weight = 0.3  # 默认问题部分权重
+            answer_weight = 1.0   # 默认答案部分权重
+            # 可以从kwargs或config中获取，这里使用默认值
             self.knowledge_enhancer = KnowledgeEnhancedCrossAttention(
-                hidden_size, num_heads
+                hidden_size, num_heads,
+                question_weight=question_weight,
+                answer_weight=answer_weight
             )
             # Cross-Attention之后的归一化层（如果Cross-Attention内部有Norm，这个可以移除，但保留以保持一致性）
             self.cross_attention_layernorm = nn.LayerNorm(hidden_size)
@@ -242,18 +412,31 @@ class EnhancedDraftLayer(nn.Module):
                 if isinstance(knowledge_cache, tuple):
                     # 直接提供KV矩阵
                     knowledge_keys, knowledge_values = knowledge_cache
+                    # 获取知识相似度（如果可用）
+                    knowledge_similarity = getattr(self, '_current_knowledge_similarity', None)
+                    # 获取答案起始位置（用于mask）
+                    answer_start_idx = getattr(self, '_current_answer_start_idx', None)
+                    # 获取当前查询长度（用于动态mask）
+                    query_length = getattr(self, '_current_query_length', None)
                     cross_attn_output = self.knowledge_enhancer(
                         hidden_states,
                         knowledge_keys=knowledge_keys,
                         knowledge_values=knowledge_values,
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        knowledge_similarity=knowledge_similarity,
+                        force_knowledge_weight=getattr(self, '_force_knowledge_weight', None),
+                        answer_start_idx=answer_start_idx,
+                        query_length=query_length
                     )
                 elif isinstance(knowledge_cache, torch.Tensor):
                     # 压缩的缓存向量
+                    knowledge_similarity = getattr(self, '_current_knowledge_similarity', None)
                     cross_attn_output = self.knowledge_enhancer(
                         hidden_states,
                         knowledge_cache=knowledge_cache,
-                        attention_mask=attention_mask
+                        attention_mask=attention_mask,
+                        knowledge_similarity=knowledge_similarity,
+                        force_knowledge_weight=getattr(self, '_force_knowledge_weight', None)
                     )
                 
                 # Step 3.1: Cross-Attention -> Add & Norm
@@ -397,15 +580,43 @@ class Qwen3DraftModel(nn.Module):
                 except:
                     query_text = "default_query"
             
-            # 检索KV矩阵
-            kv_result = self.knowledge_cache.retrieve(query_text)
+            # 检索KV矩阵（同时获取相似度和答案起始位置）
+            kv_result = self.knowledge_cache.retrieve(query_text, return_similarity=True)
             if kv_result is not None:
-                knowledge_keys, knowledge_values = kv_result
+                if len(kv_result) == 4:
+                    # 返回 (keys, values, similarity, answer_start_idx)
+                    knowledge_keys, knowledge_values, similarity, answer_start_idx = kv_result
+                    self._current_knowledge_similarity = similarity
+                    self._current_answer_start_idx = answer_start_idx
+                elif len(kv_result) == 3:
+                    # 可能是 (keys, values, similarity) 或 (keys, values, answer_start_idx)
+                    if isinstance(kv_result[2], float):
+                        knowledge_keys, knowledge_values, similarity = kv_result
+                        self._current_knowledge_similarity = similarity
+                        self._current_answer_start_idx = None
+                    else:
+                        knowledge_keys, knowledge_values, answer_start_idx = kv_result
+                        self._current_knowledge_similarity = 0.7
+                        self._current_answer_start_idx = answer_start_idx
+                else:
+                    knowledge_keys, knowledge_values = kv_result
+                    self._current_knowledge_similarity = 0.7  # 默认相似度
+                    self._current_answer_start_idx = None
+                
                 # 移动到正确的设备
                 device = hidden_states.device
                 knowledge_keys = knowledge_keys.to(device)
                 knowledge_values = knowledge_values.to(device)
                 current_knowledge = (knowledge_keys, knowledge_values)
+                
+                # 设置强制知识权重（更温和的策略）
+                if hasattr(self, '_current_knowledge_similarity'):
+                    if self._current_knowledge_similarity > 0.8:
+                        self._force_knowledge_weight = 0.6  # 至少60%使用知识（更温和）
+                    elif self._current_knowledge_similarity > 0.6:
+                        self._force_knowledge_weight = 0.4  # 至少40%使用知识
+                    else:
+                        self._force_knowledge_weight = None  # 不强制，使用相似度调整
             else:
                 # 尝试检索压缩缓存
                 compressed = self.knowledge_cache.retrieve_compressed(query_text)
@@ -438,6 +649,12 @@ class Qwen3DraftModel(nn.Module):
         # 每层：Self-Attention -> CrossAttention(使用缓存的KV) -> MLP
         # 注意：Cross-Attention在Self-Attention之后、MLP之前执行
         for i, layer in enumerate(self.enhanced_layers):
+            # 将相似度和强制权重信息传递给层
+            if hasattr(self, '_current_knowledge_similarity'):
+                layer._current_knowledge_similarity = self._current_knowledge_similarity
+            if hasattr(self, '_force_knowledge_weight'):
+                layer._force_knowledge_weight = self._force_knowledge_weight
+            
             hidden_states = layer(
                 hidden_states,
                 attention_mask=attention_mask,

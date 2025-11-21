@@ -180,30 +180,24 @@ def main():
                         avg_keys = torch.stack(all_keys).mean(dim=0)  # (num_heads, seq_len, head_dim)
                         avg_values = torch.stack(all_values).mean(dim=0)
                         
-                        # 提取答案部分的KV（关键优化：只缓存答案部分的KV）
+                        # 优化：存储问题+答案的完整KV，但记录答案起始位置
+                        # 这样在Cross-Attention时，Query和Key的语义上下文匹配（都包含问题）
                         question_len = question_ids.shape[1]
-                        answer_start_idx = question_len
                         
-                        # 只取答案部分的KV（从问题结束位置到最后）
-                        if answer_start_idx < avg_keys.shape[1]:
-                            answer_keys = avg_keys[:, answer_start_idx:, :]  # (num_heads, answer_seq_len, head_dim)
-                            answer_values = avg_values[:, answer_start_idx:, :]
-                            
-                            # 如果答案部分为空，使用完整序列的KV
-                            if answer_keys.shape[1] == 0:
-                                answer_keys = avg_keys
-                                answer_values = avg_values
-                                print(f"    警告: 答案部分为空，使用完整序列KV")
-                        else:
-                            # 如果问题长度超过序列长度，使用完整KV
-                            answer_keys = avg_keys
-                            answer_values = avg_values
-                            print(f"    警告: 问题长度超过序列长度，使用完整KV")
+                        # 存储完整KV（问题+答案），同时记录答案起始位置
+                        full_keys = avg_keys  # (num_heads, full_seq_len, head_dim)
+                        full_values = avg_values
                         
-                        # 添加到缓存（使用问题作为key，但存储答案部分的KV）
-                        cache_manager.add_knowledge(question, answer_keys, answer_values, compress=True)
-                        print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 完整序列KV: K={avg_keys.shape}, V={avg_values.shape}")
-                        print(f"    答案部分KV: K={answer_keys.shape}, V={answer_values.shape} (已缓存)")
+                        # 添加到缓存（存储完整KV和答案起始位置）
+                        cache_manager.add_knowledge(
+                            question, 
+                            full_keys, 
+                            full_values, 
+                            compress=True,
+                            answer_start_idx=question_len  # 记录答案起始位置
+                        )
+                        print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 完整KV: K={full_keys.shape}, V={full_values.shape}")
+                        print(f"    问题长度: {question_len}, 答案起始位置: {question_len}, 总长度: {full_keys.shape[1]}")
                     else:
                         print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 警告: 未提取到KV")
                 
@@ -227,18 +221,18 @@ def main():
                             k = extracted_kvs['keys']
                             v = extracted_kvs['values']
                             
-                            # 提取答案部分的KV
+                            # 存储完整KV（问题+答案），记录答案起始位置
                             question_len = question_ids.shape[1]
-                            if question_len < k.shape[1]:
-                                answer_keys = k[:, question_len:, :]
-                                answer_values = v[:, question_len:, :]
-                            else:
-                                answer_keys = k
-                                answer_values = v
                             
-                            cache_manager.add_knowledge(question, answer_keys, answer_values, compress=True)
-                            print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 完整序列KV: K={k.shape}, V={v.shape}")
-                            print(f"    答案部分KV: K={answer_keys.shape}, V={answer_values.shape} (已缓存)")
+                            cache_manager.add_knowledge(
+                                question, 
+                                k, 
+                                v, 
+                                compress=True,
+                                answer_start_idx=question_len
+                            )
+                            print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 完整KV: K={k.shape}, V={v.shape}")
+                            print(f"    问题长度: {question_len}, 答案起始位置: {question_len}, 总长度: {k.shape[1]}")
                         else:
                             print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 警告: Hook未提取到KV")
                             # 使用fallback方法
@@ -250,17 +244,17 @@ def main():
                                 k = hidden_states.squeeze(0).view(seq_len, num_heads, head_dim).transpose(0, 1)
                                 v = k.clone()  # 简化处理
                                 
-                                # 提取答案部分的KV
+                                # 存储完整KV（问题+答案），记录答案起始位置
                                 question_len = question_ids.shape[1]
-                                if question_len < k.shape[1]:
-                                    answer_keys = k[:, question_len:, :]
-                                    answer_values = v[:, question_len:, :]
-                                else:
-                                    answer_keys = k
-                                    answer_values = v
                                 
-                                cache_manager.add_knowledge(question, answer_keys, answer_values, compress=True)
-                                print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 使用fallback方法")
+                                cache_manager.add_knowledge(
+                                    question, 
+                                    k, 
+                                    v, 
+                                    compress=True,
+                                    answer_start_idx=question_len
+                                )
+                                print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 使用fallback方法，完整KV: K={k.shape}, V={v.shape}")
                 
                 # 方法3: Fallback - 使用hidden states生成模拟KV
                 else:
@@ -272,17 +266,17 @@ def main():
                         k = hidden_states.squeeze(0).view(seq_len, num_heads, head_dim).transpose(0, 1)
                         v = k.clone()  # 简化处理
                         
-                        # 提取答案部分的KV
+                        # 存储完整KV（问题+答案），记录答案起始位置
                         question_len = question_ids.shape[1]
-                        if question_len < k.shape[1]:
-                            answer_keys = k[:, question_len:, :]
-                            answer_values = v[:, question_len:, :]
-                        else:
-                            answer_keys = k
-                            answer_values = v
                         
-                        cache_manager.add_knowledge(question, answer_keys, answer_values, compress=True)
-                        print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 使用fallback方法")
+                        cache_manager.add_knowledge(
+                            question, 
+                            k, 
+                            v, 
+                            compress=True,
+                            answer_start_idx=question_len
+                        )
+                        print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 使用fallback方法，完整KV: K={k.shape}, V={v.shape}")
                     else:
                         print(f"  [{i+1}/{len(knowledge_items)}] '{question[:30]}...' - 错误: 无法提取KV")
                 
@@ -309,6 +303,7 @@ def main():
         'compressor_state': cache_manager.kv_compressor.state_dict(),
         'decompressor_state': cache_manager.kv_decompressor.state_dict(),
         'knowledge_embeddings': cache_manager.knowledge_embeddings,  # 保存embeddings
+        'answer_start_indices': cache_manager.answer_start_indices,  # 保存答案起始位置
         'config': {
             'hidden_size': base_config['hidden_size'],
             'num_heads': base_config['num_attention_heads'],

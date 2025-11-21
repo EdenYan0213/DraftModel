@@ -228,26 +228,36 @@ class DraftModelTrainer:
             # 返回一个较大的loss，但不会导致NaN
             return torch.tensor(10.0, device=self.device, requires_grad=True)
         
-        # ========== 接受概率损失计算 ==========
-        # 计算目标模型对草稿模型预测token的概率
+        # ========== 改进的接受概率损失计算 ==========
+        # 使用贪心对齐：直接最大化目标模型对草稿模型贪心预测的概率
         acceptance_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         if self.acceptance_weight > 0:
             try:
-                # 获取草稿模型的预测（贪心解码）
-                # 注意：argmax不可导，我们使用softmax的期望值来近似
-                draft_probs = F.softmax(draft_logits[:, :-1, :], dim=-1)  # (batch, seq-1, vocab)
+                # 方法1: 贪心对齐（更直接，更符合推理时的接受逻辑）
+                # 草稿模型的贪心预测（argmax）
+                draft_predictions = torch.argmax(draft_logits[:, :-1, :], dim=-1)  # (batch, seq-1)
                 
-                # 计算目标模型对这些预测的概率
+                # 目标模型的概率分布
                 target_probs = F.softmax(target_logits[:, :-1, :].detach(), dim=-1)  # (batch, seq-1, vocab)
                 
-                # 计算期望的接受概率：sum(draft_prob * target_prob)
-                # 这相当于草稿模型预测的token在目标模型中的期望概率
-                acceptance_probs = torch.sum(draft_probs * target_probs, dim=-1)  # (batch, seq-1)
+                # 获取目标模型对草稿模型预测token的概率
+                target_probs_for_draft = torch.gather(
+                    target_probs,
+                    dim=-1,
+                    index=draft_predictions.unsqueeze(-1)
+                ).squeeze(-1)  # (batch, seq-1)
                 
-                # 接受概率损失：最大化目标模型对草稿token的概率
-                # 使用负对数似然，让草稿token在目标模型中有更高概率
-                # 添加小的epsilon避免log(0)
-                acceptance_loss = -torch.mean(torch.log(acceptance_probs + 1e-8))
+                # 贪心对齐损失：使用平方损失，让小概率的惩罚更大
+                # 这样当目标模型对草稿预测的概率很小时，损失会更大，迫使模型更好地对齐
+                greedy_loss = -torch.mean((torch.log(target_probs_for_draft + 1e-8)) ** 2)
+                
+                # 方法2: 期望对齐（作为辅助，保持原有的平滑性）
+                draft_probs = F.softmax(draft_logits[:, :-1, :], dim=-1)  # (batch, seq-1, vocab)
+                acceptance_probs = torch.sum(draft_probs * target_probs, dim=-1)  # (batch, seq-1)
+                expected_loss = -torch.mean(torch.log(acceptance_probs + 1e-8))
+                
+                # 组合两种损失（贪心对齐为主，期望对齐为辅）
+                acceptance_loss = 0.7 * greedy_loss + 0.3 * expected_loss
                 
                 # 检查acceptance_loss是否为NaN
                 if torch.isnan(acceptance_loss) or torch.isinf(acceptance_loss):
@@ -255,6 +265,8 @@ class DraftModelTrainer:
                     acceptance_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
             except Exception as e:
                 print(f"\n⚠ 警告: 计算接受概率损失时出错: {e}，跳过")
+                import traceback
+                traceback.print_exc()
                 acceptance_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
         
         # ========== 注意力引导的对齐损失 ==========
@@ -335,20 +347,15 @@ class DraftModelTrainer:
                 ce_loss = torch.tensor(10.0, device=self.device, requires_grad=True)
             
             # 组合损失（添加接受概率损失和注意力对齐损失）
-            # 归一化权重：确保总权重不超过1
-            total_weight = self.kl_weight + (1 - self.kl_weight) + self.acceptance_weight + self.alignment_weight
-            if total_weight > 1.0:
-                # 如果总权重超过1，按比例缩放
-                scale = 1.0 / total_weight
-                kl_w = self.kl_weight * scale
-                ce_w = (1 - self.kl_weight) * scale
-                acc_w = self.acceptance_weight * scale
-                align_w = self.alignment_weight * scale
-            else:
-                kl_w = self.kl_weight
-                ce_w = (1 - self.kl_weight)
-                acc_w = self.acceptance_weight
-                align_w = self.alignment_weight
+            # 修复：只对KL和CE损失进行归一化，接受损失和对齐损失直接加上（不归一化）
+            # 这样接受损失的实际权重就是配置的值（0.7），而不是被归一化到0.35
+            kl_ce_total = self.kl_weight + (1 - self.kl_weight)  # 应该是1.0
+            kl_w = self.kl_weight / kl_ce_total if kl_ce_total > 0 else 0.5
+            ce_w = (1 - self.kl_weight) / kl_ce_total if kl_ce_total > 0 else 0.5
+            
+            # 接受损失和对齐损失不归一化，直接使用配置的权重
+            acc_w = self.acceptance_weight
+            align_w = self.alignment_weight
             
             total_loss = kl_w * kl_loss + ce_w * ce_loss + acc_w * acceptance_loss + align_w * alignment_loss
         else:
