@@ -156,7 +156,8 @@ def main():
     
     print(f"使用检查点: {checkpoint_path}")
     
-    device = get_device(device)
+    # 自动选择设备
+    device = get_device('auto')
     print_device_info(device)
     
     # 加载模型

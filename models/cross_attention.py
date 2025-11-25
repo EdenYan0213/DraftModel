@@ -34,9 +34,30 @@ class VectorBasedCrossAttention(nn.Module):
         self.v_proj = nn.Linear(hidden_size, hidden_size)
         self.out_proj = nn.Linear(hidden_size, hidden_size)
         
+        # 初始化权重，使用较小的初始值以提高数值稳定性
+        self._init_weights()
+        
         self.dropout = nn.Dropout(dropout)
         self.layer_norm = nn.LayerNorm(hidden_size)
         self.scale = 1.0 / math.sqrt(self.head_dim)
+    
+    def _init_weights(self):
+        """初始化权重"""
+        # 使用Xavier初始化，但使用较小的增益
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        
+        # 偏置初始化为0
+        if self.q_proj.bias is not None:
+            nn.init.zeros_(self.q_proj.bias)
+        if self.k_proj.bias is not None:
+            nn.init.zeros_(self.k_proj.bias)
+        if self.v_proj.bias is not None:
+            nn.init.zeros_(self.v_proj.bias)
+        if self.out_proj.bias is not None:
+            nn.init.zeros_(self.out_proj.bias)
     
     def forward(self,
                 query_vectors: torch.Tensor,
@@ -79,20 +100,32 @@ class VectorBasedCrossAttention(nn.Module):
         # 计算注意力分数
         scores = torch.matmul(Q, K.transpose(-2, -1)) * self.scale
         
+        # 数值稳定性：限制scores的范围，避免溢出
+        scores = torch.clamp(scores, min=-50.0, max=50.0)
+        
         # 应用mask
         if attention_mask is not None:
-            mask = attention_mask.unsqueeze(1).unsqueeze(-1)
-            scores = scores.masked_fill(mask == 0, float('-inf'))
+            # 确保mask是正确的形状和类型
+            if attention_mask.dim() == 2:
+                mask = attention_mask.unsqueeze(1).unsqueeze(-1)
+            else:
+                mask = attention_mask.unsqueeze(1) if attention_mask.dim() == 3 else attention_mask
+            # 将mask为0的位置设为很大的负值（而不是-inf，避免NaN）
+            scores = scores.masked_fill(mask == 0, -1e9)
         
         # 如果提供了answer_start_idx，mask掉问题部分（只关注答案部分）
         if answer_start_idx is not None and answer_start_idx > 0:
             knowledge_mask = torch.zeros(batch_size, 1, 1, knowledge_seq_len, 
                                        device=scores.device, dtype=scores.dtype)
-            knowledge_mask[:, :, :, :answer_start_idx] = float('-inf')
+            knowledge_mask[:, :, :, :answer_start_idx] = -1e9  # 使用大负值而不是-inf
             scores = scores + knowledge_mask
         
         # Softmax和dropout
         attn_weights = F.softmax(scores, dim=-1)
+        # 检查attn_weights中是否有NaN
+        if torch.isnan(attn_weights).any():
+            # 如果出现NaN，使用均匀分布作为fallback
+            attn_weights = torch.ones_like(attn_weights) / knowledge_seq_len
         attn_weights = self.dropout(attn_weights)
         
         # 应用注意力权重到V

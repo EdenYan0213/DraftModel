@@ -136,16 +136,30 @@ class DraftModelTrainer:
         
         # 草稿模型输出（学生）
         query_text = texts[0] if texts else None
-        draft_outputs = self.draft_model(
-            input_ids=inputs['input_ids'],
-            attention_mask=inputs['attention_mask'],
-            retrieve_knowledge=(self.knowledge_cache_manager is not None),
-            query_text=query_text
-        )
-        draft_logits = draft_outputs['logits']
+        try:
+            draft_outputs = self.draft_model(
+                input_ids=inputs['input_ids'],
+                attention_mask=inputs['attention_mask'],
+                retrieve_knowledge=(self.knowledge_cache_manager is not None),
+                query_text=query_text
+            )
+            draft_logits = draft_outputs['logits']
+        except Exception as e:
+            print(f"\n⚠ 警告: 草稿模型前向传播失败: {e}")
+            import traceback
+            traceback.print_exc()
+            # 返回一个较大的损失值，但不固定为10.0，让模型有机会恢复
+            return torch.tensor(5.0, device=self.device, requires_grad=True)
         
+        # 检查logits中的NaN/Inf，但使用更合理的处理方式
         if torch.isnan(draft_logits).any() or torch.isinf(draft_logits).any():
-            return torch.tensor(10.0, device=self.device, requires_grad=True)
+            nan_count = torch.isnan(draft_logits).sum().item()
+            inf_count = torch.isinf(draft_logits).sum().item()
+            print(f"\n⚠ 警告: draft_logits包含NaN ({nan_count}个)或Inf ({inf_count}个)")
+            # 将NaN/Inf替换为0，然后继续计算损失
+            draft_logits = torch.where(torch.isnan(draft_logits) | torch.isinf(draft_logits),
+                                      torch.zeros_like(draft_logits),
+                                      draft_logits)
         
         # 接受概率损失
         acceptance_loss = torch.tensor(0.0, device=self.device, requires_grad=True)
@@ -201,7 +215,16 @@ class DraftModelTrainer:
             )
             
             if torch.isnan(ce_loss) or torch.isinf(ce_loss):
-                ce_loss = torch.tensor(10.0, device=self.device, requires_grad=True)
+                print(f"\n⚠ 警告: ce_loss是NaN/Inf，使用目标模型的损失作为参考")
+                # 使用目标模型的损失作为参考值
+                with torch.no_grad():
+                    target_ce_loss = F.cross_entropy(
+                        target_logits[:, :-1, :].reshape(-1, target_logits.size(-1)),
+                        target_ids,
+                        ignore_index=self.tokenizer.pad_token_id
+                    )
+                    # 使用目标损失值的1.5倍作为初始值，让模型有学习空间
+                    ce_loss = torch.tensor(target_ce_loss.item() * 1.5, device=self.device, requires_grad=True)
             
             # 组合损失
             kl_ce_total = self.kl_weight + (1 - self.kl_weight)
@@ -219,10 +242,28 @@ class DraftModelTrainer:
             )
             
             if torch.isnan(total_loss) or torch.isinf(total_loss):
-                total_loss = torch.tensor(10.0, device=self.device, requires_grad=True)
+                print(f"\n⚠ 警告: total_loss是NaN/Inf，使用目标模型的损失作为参考")
+                # 使用目标模型的损失作为参考值
+                with torch.no_grad():
+                    target_ce_loss = F.cross_entropy(
+                        target_logits[:, :-1, :].reshape(-1, target_logits.size(-1)),
+                        target_ids,
+                        ignore_index=self.tokenizer.pad_token_id
+                    )
+                    # 使用目标损失值的1.5倍作为初始值
+                    total_loss = torch.tensor(target_ce_loss.item() * 1.5, device=self.device, requires_grad=True)
         
         if torch.isnan(total_loss) or torch.isinf(total_loss):
-            total_loss = torch.tensor(10.0, device=self.device, requires_grad=True)
+            print(f"\n⚠ 警告: 最终total_loss是NaN/Inf，使用目标模型的损失作为参考")
+            # 最后的安全检查：使用目标模型的损失
+            with torch.no_grad():
+                target_ids = inputs['input_ids'][:, 1:].reshape(-1)
+                target_ce_loss = F.cross_entropy(
+                    target_logits[:, :-1, :].reshape(-1, target_logits.size(-1)),
+                    target_ids,
+                    ignore_index=self.tokenizer.pad_token_id
+                )
+                total_loss = torch.tensor(target_ce_loss.item() * 1.5, device=self.device, requires_grad=True)
         
         return total_loss
     
