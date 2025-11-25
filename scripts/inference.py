@@ -93,6 +93,13 @@ def generate_text(model, tokenizer, prompt: str, max_new_tokens: int = 50,
             
             logits = logits[:, -1, :] / temperature
             
+            # 检查并清理logits中的NaN/Inf
+            if torch.isnan(logits).any() or torch.isinf(logits).any():
+                # 将NaN/Inf替换为很小的值
+                logits = torch.where(torch.isnan(logits) | torch.isinf(logits),
+                                    torch.full_like(logits, -1e10),
+                                    logits)
+            
             # Top-p采样
             if top_p < 1.0:
                 sorted_logits, sorted_indices = torch.sort(logits, descending=True)
@@ -103,7 +110,22 @@ def generate_text(model, tokenizer, prompt: str, max_new_tokens: int = 50,
                 indices_to_remove = sorted_indices_to_remove.scatter(1, sorted_indices, sorted_indices_to_remove)
                 logits[indices_to_remove] = float('-inf')
             
+            # 计算概率，确保数值稳定性
             probs = torch.softmax(logits, dim=-1)
+            
+            # 检查概率是否有效（没有NaN/Inf/负数）
+            if torch.isnan(probs).any() or torch.isinf(probs).any() or (probs < 0).any():
+                # 如果概率无效，使用均匀分布作为fallback
+                print(f"⚠ 警告: 检测到无效概率，使用均匀分布")
+                probs = torch.ones_like(probs) / probs.size(-1)
+            else:
+                # 确保概率和为1（数值误差可能导致偏差）
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+                # 确保所有概率都是非负的
+                probs = torch.clamp(probs, min=0.0)
+                # 重新归一化
+                probs = probs / probs.sum(dim=-1, keepdim=True)
+            
             next_token = torch.multinomial(probs, num_samples=1)
             
             if next_token.item() == tokenizer.eos_token_id:

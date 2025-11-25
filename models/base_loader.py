@@ -25,8 +25,8 @@ class Qwen3Loader:
             device = get_device(device)
             print_device_info(device)
             
-            # MPS不支持float16，需要使用float32
-            dtype = torch.float32 if device == "mps" else (torch.float16 if device == "cuda" else torch.float32)
+            # 统一使用float32以提高数值稳定性（CUDA也使用float32）
+            dtype = torch.float32
             
             # 对于MPS，不使用device_map，手动移动
             if device == "mps":

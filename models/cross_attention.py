@@ -111,20 +111,20 @@ class VectorBasedCrossAttention(nn.Module):
             else:
                 mask = attention_mask.unsqueeze(1) if attention_mask.dim() == 3 else attention_mask
             # 将mask为0的位置设为很大的负值（而不是-inf，避免NaN）
-            scores = scores.masked_fill(mask == 0, -1e9)
+            scores = scores.masked_fill(mask == 0, -1e4)
         
         # 如果提供了answer_start_idx，mask掉问题部分（只关注答案部分）
         if answer_start_idx is not None and answer_start_idx > 0:
             knowledge_mask = torch.zeros(batch_size, 1, 1, knowledge_seq_len, 
                                        device=scores.device, dtype=scores.dtype)
-            knowledge_mask[:, :, :, :answer_start_idx] = -1e9  # 使用大负值而不是-inf
+            knowledge_mask[:, :, :, :answer_start_idx] = -1e4
             scores = scores + knowledge_mask
         
         # Softmax和dropout
         attn_weights = F.softmax(scores, dim=-1)
-        # 检查attn_weights中是否有NaN
-        if torch.isnan(attn_weights).any():
-            # 如果出现NaN，使用均匀分布作为fallback
+        # 检查attn_weights中是否有NaN/Inf（虽然现在用float32应该很少出现，但保留检查以确保健壮性）
+        if torch.isnan(attn_weights).any() or torch.isinf(attn_weights).any():
+            # 如果出现NaN/Inf，使用均匀分布作为fallback
             attn_weights = torch.ones_like(attn_weights) / knowledge_seq_len
         attn_weights = self.dropout(attn_weights)
         
