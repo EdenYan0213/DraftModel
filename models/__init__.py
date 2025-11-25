@@ -1,22 +1,16 @@
 """
-Qwen3 草稿模型模块
+模型模块
 """
 
 from .base_loader import Qwen3Loader
-from .layer_sampler import LayerSampler
-from .knowledge_enhanced_draft import (
-    Qwen3DraftModel,
-    EnhancedDraftLayer,
-    KnowledgeEnhancedCrossAttention
-)
+from .draft_model import Qwen3DraftModel, EnhancedDraftLayer
 from .knowledge_cache import KnowledgeCacheManager
+from .cross_attention import VectorBasedCrossAttention
 
 __all__ = [
     'Qwen3Loader',
-    'LayerSampler',
     'Qwen3DraftModel',
     'EnhancedDraftLayer',
-    'KnowledgeEnhancedCrossAttention',
-    'KnowledgeCacheManager'
+    'KnowledgeCacheManager',
+    'VectorBasedCrossAttention',
 ]
-

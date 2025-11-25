@@ -1,275 +1,179 @@
-# Qwen3-0.6B 草稿模型完整实现
+# 知识增强的草稿模型 (Knowledge-Enhanced Draft Model)
 
-基于 Qwen3-0.6B 构建的草稿模型，包含均匀采样层和知识增强功能。已训练完成，速度比原模型快 **1.64倍**。
+基于知识增强的草稿模型，用于加速大语言模型的推理。通过知识缓存和交叉注意力机制，在保持生成质量的同时提升推理速度。
 
-## 🏗️ 项目结构
+## 特性
+
+- **知识增强**: 使用知识缓存存储prefill阶段的token向量，通过相似度检索增强生成
+- **交叉注意力**: 基于向量的交叉注意力机制，灵活处理不同长度的序列
+- **参数高效**: 只训练前N层（默认3层），大幅减少参数量
+- **速度提升**: 相比目标模型，推理速度提升约1.2-1.3倍
+
+## 项目结构
 
 ```
 CrossAndAttention/
-├── configs/
-│   └── qwen3_0.6b_config.yaml          # 主配置文件
-├── models/
-│   ├── __init__.py
-│   ├── base_loader.py                   # 模型加载器
-│   ├── layer_sampler.py                 # 层采样策略
-│   ├── knowledge_cache.py               # 知识缓存管理
-│   └── knowledge_enhanced_draft.py      # 知识增强草稿模型
-├── training/
-│   ├── __init__.py
-│   ├── draft_trainer.py                 # 训练器
-│   └── data_utils.py                    # 数据处理工具
-├── inference/
-│   ├── __init__.py
-│   └── speculative_decoder.py           # 推测解码器
-├── scripts/
-│   ├── train_draft.py                   # 训练脚本
-│   ├── build_knowledge_cache.py         # 构建知识缓存
-│   ├── test_trained_model.py            # 测试训练好的模型
-│   └── benchmark_speed.py                # 速度对比测试
-├── output/
-│   ├── checkpoints/
-│   │   └── best_draft_model_epoch5.pth  # 最佳模型（4.3GB）
-│   └── knowledge_cache/
-│       └── knowledge_cache.pth          # 知识缓存
-├── requirements.txt                     # 依赖包
-└── README.md                            # 本文档
+├── models/              # 模型定义
+│   ├── base_loader.py      # 基础模型加载器
+│   ├── draft_model.py      # 草稿模型
+│   ├── knowledge_cache.py  # 知识缓存管理器
+│   └── cross_attention.py  # 交叉注意力机制
+├── training/            # 训练相关
+│   ├── draft_trainer.py   # 训练器
+│   └── data_utils.py      # 数据工具
+├── scripts/             # 脚本
+│   ├── build_knowledge_cache.py  # 构建知识缓存
+│   ├── train.py              # 训练脚本
+│   └── inference.py         # 推理测试
+├── configs/             # 配置文件
+│   └── qwen3_0.6b_config.yaml
+└── output/              # 输出目录
+    ├── checkpoints/     # 模型检查点
+    └── knowledge_cache/ # 知识缓存
 ```
 
-## 🚀 快速开始
+## 快速开始
 
-### 1. 环境设置
+### 1. 安装依赖
 
 ```bash
 pip install -r requirements.txt
 ```
 
-### 2. 构建知识缓存（首次运行）
+主要依赖：
+- torch
+- transformers
+- sentence-transformers (用于知识检索)
+- tqdm
+- pyyaml
+
+### 2. 构建知识缓存（第一步）
+
+#### 方式1: 构建单个知识缓存（默认）
 
 ```bash
-python scripts/build_knowledge_cache.py
+python scripts/generate_knowledge_from_model.py
 ```
 
-这将：
-- 加载 Qwen3-0.6B 基础模型
-- 对常见问题进行前向传播
-- 提取并存储 KV 缓存
-- 保存到 `output/knowledge_cache/knowledge_cache.pth`
+**功能**：
+- 使用预定义的FAQ问答对（30条，涵盖7个领域）
+- 对每个问答对进行prefill，提取token向量
+- 存储完整的问答对文本和token向量
+- 生成知识缓存文件：`output/knowledge_cache/knowledge_cache.pth`
 
-### 3. 训练草稿模型
+#### 方式2: 构建多个知识缓存（按领域分类）
 
 ```bash
-python scripts/train_draft.py
+python scripts/build_multiple_knowledge_caches.py
 ```
 
-训练过程包括：
-- 知识蒸馏（KL散度损失）
-- 交叉熵损失
-- 验证和检查点保存
-- 自动保存最佳模型
+**功能**：
+- 按领域分别构建知识缓存文件
+- 生成8个知识缓存文件（7个领域 + 1个合并）
+- 每个领域独立的知识缓存，便于按需使用
 
-**训练结果**：
-- 训练损失: 8.85
-- 验证损失: 7.95
-- 训练轮数: 5 epochs
-- 采样层: [0, 5, 11, 16, 22, 27] (从28层中采样6层)
+**生成的文件**：
+- `knowledge_cache_ai_ml.pth` - 人工智能与机器学习
+- `knowledge_cache_cs.pth` - 计算机科学
+- `knowledge_cache_math.pth` - 数学
+- `knowledge_cache_physics.pth` - 物理学
+- `knowledge_cache_biology.pth` - 生物学
+- `knowledge_cache_history.pth` - 历史与文化
+- `knowledge_cache_economics.pth` - 经济学
+- `knowledge_cache.pth` - 全部领域（合并，默认使用）
 
-### 4. 测试训练好的模型
+**注意**: 
+- 知识缓存只需要构建一次
+- 如果已存在，会跳过已有项，只添加新的
+- 可以随时添加新的FAQ问答对
+- 训练脚本默认使用 `knowledge_cache.pth`（全部领域）
+
+### 3. 训练模型（第二步）
 
 ```bash
-python scripts/test_trained_model.py
+python scripts/train.py
 ```
 
-### 5. 速度对比测试
+**功能**：
+- 加载基础模型和知识缓存
+- **自动使用知识缓存中的完整问答对作为训练数据**
+- 训练草稿模型，学习如何利用知识缓存
+- 保存最佳模型到 `output/checkpoints/`
+
+**注意**: 
+- 训练前必须确保知识缓存已构建完成
+- 如果知识缓存不存在，脚本会报错并提示先构建
+
+**详细使用说明**: 参见 [USAGE.md](USAGE.md)
+
+训练配置在 `configs/qwen3_0.6b_config.yaml` 中：
+- `num_sampled_layers: 3` - 选择前3层进行训练
+- `batch_size: 8` - 批次大小
+- `learning_rate: 3e-5` - 学习率
+- `num_epochs: 5` - 训练轮数
+
+### 4. 推理测试
 
 ```bash
-python scripts/benchmark_speed.py
+python scripts/inference.py
 ```
 
-**测试结果**：
-- 草稿模型速度: **11.29 tokens/s**
-- 目标模型速度: 8.85 tokens/s
-- **加速比: 1.64x** (快63.6%)
+## 配置说明
 
-## 📋 主要特性
+主要配置项：
 
-### 1. 均匀层采样
-- 从 Qwen3-0.6B 的28层中智能采样6层
-- 支持均匀、几何、对数三种采样策略
-- 自动包含首层和尾层
-
-### 2. 知识增强
-- 交叉注意力机制
-- 知识缓存查询（15个常见问题的KV缓存）
-- 门控融合机制
-
-### 3. 完整训练流程
-- 知识蒸馏训练
-- 支持梯度累积
-- 学习率调度
-- 自动检查点保存
-- 数值稳定性检查
-- 梯度裁剪
-
-### 4. 推测解码
-- 使用草稿模型加速推理
-- 目标模型验证机制
-- 自动接受/拒绝策略
-
-## ⚙️ 配置说明
-
-主要配置文件：`configs/qwen3_0.6b_config.yaml`
-
-### 草稿模型配置
 ```yaml
+# 草稿模型配置
 draft_model:
-  sampling_strategy: "uniform"  # uniform, geometric, logarithmic
-  num_sampled_layers: 6
-  sampled_indices: [0, 5, 11, 16, 22, 27]
-  add_knowledge_enhancement: true
-```
+  num_sampled_layers: 3  # 选择前N层
 
-### 训练配置
-```yaml
+# 知识增强配置
+knowledge_enhancement:
+  enabled: true
+  use_vector_retrieval: true  # 使用向量相似度检索
+
+# 训练配置
 training:
   batch_size: 8
   learning_rate: 3e-5
   num_epochs: 5
-  use_knowledge_distillation: true
-  kl_divergence_weight: 0.8
-  max_seq_length: 512
-  gradient_accumulation_steps: 2
+  kl_divergence_weight: 0.5      # KL散度损失权重
+  acceptance_loss_weight: 0.3    # 接受损失权重
 ```
 
-### 知识增强配置
-```yaml
-knowledge_enhancement:
-  enabled: true
-  cache_dim: 512
-  num_heads: 8
-  fusion_gate: true
-```
+## 工作原理
 
-## 📊 训练结果
+### 1. 知识缓存
 
-### 性能指标
-- **训练损失**: 8.85 (从初始 502.78 下降)
-- **验证损失**: 7.95 (最佳模型)
-- **验证困惑度**: 2833.54
-- **训练轮数**: 5 epochs
-- **采样层**: [0, 5, 11, 16, 22, 27]
+- 存储"问题+答案"输入给基础模型后，prefill阶段输出的token向量
+- 使用sentence-transformers进行相似度检索
+- 每个知识项包含token向量序列和答案起始位置
 
-### 速度对比
-- **草稿模型**: 11.29 tokens/s
-- **目标模型**: 8.85 tokens/s
-- **加速比**: 1.64x
-- **速度提升**: 63.6%
+### 2. 交叉注意力
 
-### 模型文件
-- **最佳模型**: `output/checkpoints/best_draft_model_epoch5.pth` (4.3 GB)
-- **知识缓存**: `output/knowledge_cache/knowledge_cache.pth`
+- 输入：问题序列向量 + 检索到的相似序列向量
+- 从向量投影得到QKV矩阵
+- 支持mask答案部分（只关注答案，忽略问题部分）
 
-## 🔧 使用示例
+### 3. 训练损失
 
-### 加载并测试训练好的模型
+- **KL散度损失**: 知识蒸馏，让草稿模型学习目标模型的分布
+- **交叉熵损失**: 标准语言建模损失
+- **接受概率损失**: 最大化目标模型对草稿模型预测的接受概率
 
-```python
-import torch
-import yaml
-from models.base_loader import Qwen3Loader
-from models.knowledge_enhanced_draft import Qwen3DraftModel
+## 性能
 
-# 加载配置
-with open("configs/qwen3_0.6b_config.yaml", 'r') as f:
-    config = yaml.safe_load(f)
+- **参数压缩**: 使用前3层，参数量约为目标模型的10-15%
+- **速度提升**: 推理速度提升约1.2-1.3倍
+- **生成质量**: 在知识相关任务上表现良好
 
-# 加载基础模型和tokenizer
-loader = Qwen3Loader("configs/qwen3_0.6b_config.yaml")
-target_model = loader.load_target_model(device='cpu')
-tokenizer = loader.load_tokenizer()
+## 注意事项
 
-# 确保pad_token设置
-if tokenizer.pad_token is None:
-    tokenizer.pad_token = tokenizer.eos_token
+1. **数据量**: 建议至少800+训练样本，以获得稳定的训练效果
+2. **知识库**: 当前知识库较小（8个知识项），可根据需要扩展
+3. **设备**: 支持CPU和CUDA，MPS可能有兼容性问题
 
-# 加载知识缓存
-from models.knowledge_cache import KnowledgeCacheManager
-cache_path = "output/knowledge_cache/knowledge_cache.pth"
-cache_data = torch.load(cache_path, map_location='cpu')
-knowledge_cache_manager = KnowledgeCacheManager(
-    hidden_size=config['base_model']['hidden_size'],
-    num_heads=config['base_model']['num_attention_heads'],
-    cache_dim=config['knowledge_enhancement']['cache_dim']
-)
-knowledge_cache_manager.kv_cache = cache_data.get('kv_cache', {})
+## 许可证
 
-# 创建并加载草稿模型
-draft_model = Qwen3DraftModel(config, target_model, knowledge_cache_manager=knowledge_cache_manager)
-draft_model = draft_model.cpu()
-draft_model.eval()
-
-# 加载训练好的权重
-checkpoint = torch.load(
-    "output/checkpoints/best_draft_model_epoch5.pth",
-    map_location='cpu'
-)
-draft_model.load_state_dict(checkpoint['model_state_dict'])
-
-# 推理
-text = "今天天气很好，"
-inputs = tokenizer(text, return_tensors='pt', padding=True)
-
-# 确保attention_mask存在
-if 'attention_mask' not in inputs:
-    pad_token_id = tokenizer.pad_token_id or tokenizer.eos_token_id
-    inputs['attention_mask'] = (inputs['input_ids'] != pad_token_id).long()
-
-with torch.no_grad():
-    outputs = draft_model(**inputs)
-    logits = outputs['logits']
-    
-    # 获取下一个token
-    next_token_logits = logits[:, -1, :]
-    next_token = torch.argmax(next_token_logits, dim=-1)
-    predicted = tokenizer.decode([next_token.item()])
-    
-    print(f"输入: {text}")
-    print(f"预测: {predicted}")
-```
-
-### 使用推测解码
-
-```python
-from inference.speculative_decoder import SpeculativeDecoder
-
-decoder = SpeculativeDecoder(draft_model, target_model, tokenizer, gamma=4)
-generated = decoder.generate(
-    input_ids,
-    max_new_tokens=50,
-    temperature=0.8,
-    top_p=0.9
-)
-```
-
-## 📝 注意事项
-
-1. **模型下载**: 首次运行需要下载 Qwen3-0.6B 模型，确保网络连接正常
-2. **设备支持**: 支持 CUDA、MPS (Apple Silicon) 和 CPU
-3. **训练时间**: 完整训练可能需要数小时，取决于硬件配置
-4. **数据准备**: 当前使用示例数据，实际应用需要准备真实训练数据
-5. **Attention Mask**: 已自动处理，不再出现 pad_token == eos_token 的警告
-6. **数值稳定性**: 已添加 NaN/Inf 检测和梯度裁剪
-
-## 🔍 已修复的问题
-
-1. ✅ **Attention Mask 警告**: 已自动创建 attention_mask，不再出现警告
-2. ✅ **数值稳定性**: 添加了 NaN/Inf 检测和梯度裁剪
-3. ✅ **模型保存**: 自动保存最佳模型和检查点
-4. ✅ **进度显示**: 训练过程显示进度条
-
-## 📈 性能优化建议
-
-1. **使用真实数据**: 使用真实数据集可以进一步提高模型质量
-2. **调整超参数**: 可以尝试不同的学习率、batch size等
-3. **继续训练**: 可以从检查点继续训练更多轮次
-4. **量化加速**: 考虑使用模型量化进一步加速
+本项目遵循原项目的许可证。
 

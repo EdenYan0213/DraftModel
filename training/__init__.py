@@ -3,20 +3,10 @@
 """
 
 from .draft_trainer import DraftModelTrainer
-from .data_utils import (
-    TextDataset, 
-    create_sample_dataloader,
-    load_texts_from_file,
-    create_dataloader_from_file,
-    create_dataloader_from_list
-)
+from .data_utils import create_sample_dataloader, KnowledgeDataset
 
 __all__ = [
     'DraftModelTrainer',
-    'TextDataset',
     'create_sample_dataloader',
-    'load_texts_from_file',
-    'create_dataloader_from_file',
-    'create_dataloader_from_list'
+    'KnowledgeDataset',
 ]
-

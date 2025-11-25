@@ -10,11 +10,9 @@ base_model:
 
 # 草稿模型配置
 draft_model:
-  sampling_strategy: "uniform"  # uniform, geometric, logarithmic
-  num_sampled_layers: 6
-  sampled_indices: [0, 5, 11, 16, 22, 27]  # 均匀采样示例
+  num_sampled_layers: 3  # 选择前3层
   add_knowledge_enhancement: true
-  knowledge_retrieval_topk: 3
+  knowledge_retrieval_topk: 1
 
 # 知识增强配置
 knowledge_enhancement:
@@ -35,8 +33,6 @@ training:
   max_seq_length: 2048
   gradient_accumulation_steps: 2
   use_knowledge_distillation: true
-  kl_divergence_weight: 0.5  # 降低，因为不够直接（从0.8降低）
-  acceptance_loss_weight: 0.7  # 增加，这是最直接的对齐方法（从0.3增加）
-  alignment_loss_weight: 0.3  # 略微增加（从0.2增加）
-  newline_token_weight: 0.3  # 换行符token权重（降低换行符在训练中的重要性，防止模型过度学习换行符）
+  kl_divergence_weight: 0.5  # KL散度损失权重
+  acceptance_loss_weight: 0.3  # 接受损失权重
 

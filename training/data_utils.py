@@ -1,10 +1,16 @@
-from torch.utils.data import Dataset, DataLoader
-from typing import List, Any
+"""
+数据工具
+"""
 
-class TextDataset(Dataset):
-    """文本数据集"""
+import torch
+from torch.utils.data import Dataset, DataLoader
+from typing import List
+
+
+class KnowledgeDataset(Dataset):
+    """知识增强数据集"""
     
-    def __init__(self, texts: List[str], tokenizer: Any, max_length: int = 2048):
+    def __init__(self, texts: List[str], tokenizer, max_length: int = 2048):
         self.texts = texts
         self.tokenizer = tokenizer
         self.max_length = max_length
@@ -14,162 +20,109 @@ class TextDataset(Dataset):
     
     def __getitem__(self, idx):
         text = self.texts[idx]
-        
-        # Tokenize
-        encoding = self.tokenizer(
+        inputs = self.tokenizer(
             text,
-            max_length=self.max_length,
-            padding=False,
+            return_tensors="pt",
+            padding="max_length",
             truncation=True,
-            return_tensors=None
+            max_length=self.max_length
         )
         
         return {
-            'text': text,
-            'input_ids': encoding['input_ids'],
-            'attention_mask': encoding['attention_mask']
-        }
-    
-    def collate_fn(self, batch):
-        """批处理函数"""
-        texts = [item['text'] for item in batch]
-        input_ids = [item['input_ids'] for item in batch]
-        attention_mask = [item['attention_mask'] for item in batch]
-        
-        # 填充
-        padded_inputs = self.tokenizer.pad(
-            {
-                'input_ids': input_ids,
-                'attention_mask': attention_mask
-            },
-            padding=True,
-            return_tensors='pt'
-        )
-        
-        return {
-            'text': texts,
-            'input_ids': padded_inputs['input_ids'],
-            'attention_mask': padded_inputs['attention_mask']
+            'input_ids': inputs['input_ids'].squeeze(0),
+            'attention_mask': inputs['attention_mask'].squeeze(0),
+            'text': text
         }
 
-def create_sample_dataloader(tokenizer: Any, batch_size: int = 8, 
-                           num_samples: int = 1000, max_length: int = 2048) -> DataLoader:
-    """创建示例数据加载器"""
-    
-    # 示例文本数据
-    sample_texts = [
-        "深度学习是机器学习的一个分支，它通过多层神经网络来学习数据的层次化表示。",
-        "自然语言处理是人工智能的一个重要领域，旨在让计算机理解、解释和生成人类语言。",
-        "Transformer架构通过自注意力机制实现了高效的序列建模，已成为自然语言处理的主流架构。",
-        "预训练语言模型如GPT系列通过在大量文本数据上进行预训练，获得了强大的语言理解和生成能力。",
-        "强化学习通过试错来学习最优策略，在游戏AI、机器人控制等领域取得了显著成果。",
-        "计算机视觉使计算机能够理解和分析图像和视频内容，广泛应用于安防、医疗、自动驾驶等领域。",
-        "大数据技术使得我们能够处理和分析海量数据，从中提取有价值的信息和洞察。",
-        "云计算提供了按需获取的计算资源，极大地降低了企业的IT成本和运维复杂度。",
-        "区块链技术通过去中心化和不可篡改的特性，为数字货币和智能合约提供了安全基础。",
-        "物联网将物理世界与数字世界连接起来，实现了设备的智能化和远程控制。"
-    ]
-    
-    # 扩展样本数据
-    expanded_texts = []
-    for i in range(num_samples):
-        base_text = sample_texts[i % len(sample_texts)]
-        # 添加一些变化
-        variation = f" 样本{i}: 这是关于相关主题的扩展文本。"
-        expanded_texts.append(base_text + variation)
-    
-    # 创建数据集
-    dataset = TextDataset(expanded_texts, tokenizer, max_length)
-    
-    # 创建数据加载器
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=dataset.collate_fn
-    )
-    
-    print(f"创建数据加载器: {len(dataloader)} 批次, 每批次 {batch_size} 样本")
-    
-    return dataloader
 
-
-def load_texts_from_file(file_path: str, encoding: str = 'utf-8') -> List[str]:
-    """
-    从文本文件加载数据，每行一个样本
-    
-    Args:
-        file_path: 文件路径
-        encoding: 文件编码，默认utf-8
-    
-    Returns:
-        文本列表
-    """
-    texts = []
-    with open(file_path, 'r', encoding=encoding) as f:
-        for line in f:
-            line = line.strip()
-            if line:  # 跳过空行
-                texts.append(line)
-    return texts
-
-
-def create_dataloader_from_file(tokenizer: Any, file_path: str, 
-                                batch_size: int = 8, max_length: int = 2048,
-                                encoding: str = 'utf-8') -> DataLoader:
-    """
-    从文件创建数据加载器
+def create_sample_dataloader(tokenizer, batch_size: int = 8, max_length: int = 2048, 
+                            knowledge_cache_manager=None):
+    """创建示例数据加载器
     
     Args:
         tokenizer: tokenizer
-        file_path: 数据文件路径（每行一个样本）
-        batch_size: 批次大小
-        max_length: 最大序列长度
-        encoding: 文件编码
-    
-    Returns:
-        DataLoader
+        batch_size: batch size
+        max_length: max sequence length
+        knowledge_cache_manager: 知识缓存管理器，如果提供，将使用知识缓存中的问答对作为训练数据
     """
-    print(f"从文件加载数据: {file_path}")
-    texts = load_texts_from_file(file_path, encoding)
-    print(f"加载了 {len(texts)} 个样本")
     
-    dataset = TextDataset(texts, tokenizer, max_length)
-    dataloader = DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        collate_fn=dataset.collate_fn
+    # 如果提供了知识缓存，使用知识缓存中的问答对
+    if knowledge_cache_manager is not None and len(knowledge_cache_manager.knowledge_cache) > 0:
+        print(f"使用知识缓存中的问答对作为训练数据")
+        sample_texts = []
+        
+        # 从知识缓存中提取完整的问答对
+        if hasattr(knowledge_cache_manager, 'qa_pairs') and len(knowledge_cache_manager.qa_pairs) > 0:
+            # 使用存储的完整问答对
+            for question, (q, a) in knowledge_cache_manager.qa_pairs.items():
+                # 组合成完整的训练文本：问题 + 空格 + 答案（与构建知识缓存时的格式一致）
+                # 注意：这里需要与 extract_prefill_vectors 中的格式保持一致
+                # 如果构建时是 question + answer（无空格），这里也应该是 q + a
+                # 但为了更好的tokenization，建议在问题和答案之间加空格
+                full_text = q + " " + a if not q.endswith(" ") and not a.startswith(" ") else q + a
+                sample_texts.append(full_text)
+            print(f"  从qa_pairs中提取了 {len(sample_texts)} 条完整问答对")
+            
+            # 检查是否有知识项没有对应的qa_pairs
+            cache_keys = set(knowledge_cache_manager.knowledge_cache.keys())
+            qa_keys = set(knowledge_cache_manager.qa_pairs.keys())
+            missing_keys = cache_keys - qa_keys
+            if missing_keys:
+                print(f"  ⚠ 警告: 有 {len(missing_keys)} 个知识项没有对应的qa_pairs，这些项将不会用于训练")
+                print(f"     建议重新构建知识缓存以确保所有知识项都有对应的qa_pairs")
+        else:
+            # 如果没有qa_pairs，尝试从问题构建（向后兼容）
+            print(f"  警告: 知识缓存中没有qa_pairs，使用问题作为训练数据")
+            for question in knowledge_cache_manager.knowledge_cache.keys():
+                sample_texts.append(question)
+        
+        print(f"  共 {len(sample_texts)} 条训练样本")
+    else:
+        # 使用默认的训练数据
+        sample_texts = [
+            "深度学习是人工智能的一个分支，它使用多层神经网络来学习数据的特征表示。",
+            "自然语言处理是人工智能的一个分支，它主要研究如何让计算机理解并处理人类语言。",
+            "计算机视觉是计算机科学与工程的交叉学科，它涉及到图像处理、模式识别、机器学习和人工智能等技术。",
+            "强化学习是人工智能的一个重要分支，它在很多领域都有广泛的应用，包括自动驾驶、机器人、医疗诊断等。",
+            "Transformer架构是一种基于注意力机制的神经网络架构，它在自然语言处理领域取得了突破性进展。",
+            "机器学习是人工智能的一个分支，它使计算机能够从数据中学习，而无需明确编程。",
+            "注意力机制是神经网络中用于解决长距离依赖问题的一种机制，它允许模型在处理序列时关注不同位置的信息。",
+            "神经网络是一种模拟人脑神经元结构的计算模型，它由多个层级的节点（神经元）组成，通过权重连接。",
+        ]
+    
+    # 扩展数据集（根据数据量调整扩展倍数）
+    if len(sample_texts) < 50:
+        # 如果数据量少，多扩展一些
+        expansion_factor = max(50, 100 // len(sample_texts))
+    else:
+        # 如果数据量多，少扩展一些
+        expansion_factor = max(10, 50 // len(sample_texts))
+    
+    expanded_texts = sample_texts * expansion_factor
+    print(f"训练数据: {len(sample_texts)} 条样本，扩展 {expansion_factor} 倍 = {len(expanded_texts)} 条")
+    
+    dataset = KnowledgeDataset(expanded_texts, tokenizer, max_length)
+    
+    # 80%训练集，20%验证集
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
     )
     
-    print(f"创建数据加载器: {len(dataloader)} 批次, 每批次 {batch_size} 样本")
-    return dataloader
-
-
-def create_dataloader_from_list(tokenizer: Any, texts: List[str],
-                               batch_size: int = 8, max_length: int = 2048) -> DataLoader:
-    """
-    从文本列表创建数据加载器
-    
-    Args:
-        tokenizer: tokenizer
-        texts: 文本列表
-        batch_size: 批次大小
-        max_length: 最大序列长度
-    
-    Returns:
-        DataLoader
-    """
-    print(f"从列表创建数据加载器: {len(texts)} 个样本")
-    
-    dataset = TextDataset(texts, tokenizer, max_length)
-    dataloader = DataLoader(
-        dataset,
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=batch_size,
         shuffle=True,
-        collate_fn=dataset.collate_fn
+        num_workers=0
     )
     
-    print(f"创建数据加载器: {len(dataloader)} 批次, 每批次 {batch_size} 样本")
-    return dataloader
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=0
+    )
+    
+    return train_loader, val_loader
 
