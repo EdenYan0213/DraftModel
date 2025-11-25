@@ -62,7 +62,7 @@ def load_model(config_path: str, checkpoint_path: str, device: str = 'cpu'):
 
 
 def generate_text(model, tokenizer, prompt: str, max_new_tokens: int = 50, 
-                 temperature: float = 0.3, top_p: float = 0.9):
+                 temperature: float = 0.7, top_p: float = 0.9):
     """生成文本"""
     device = next(model.parameters()).device
     inputs = tokenizer(prompt, return_tensors="pt")

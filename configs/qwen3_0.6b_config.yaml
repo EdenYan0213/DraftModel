@@ -33,6 +33,6 @@ training:
   max_seq_length: 2048
   gradient_accumulation_steps: 2
   use_knowledge_distillation: true
-  kl_divergence_weight: 0.5  # KL散度损失权重
+  kl_divergence_weight: 0.8  # KL散度损失权重
   acceptance_loss_weight: 0.3  # 接受损失权重
 

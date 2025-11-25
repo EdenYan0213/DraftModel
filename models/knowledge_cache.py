@@ -70,11 +70,7 @@ class KnowledgeCacheManager:
         
         # 计算并存储embedding（用于相似度检索）
         if self.use_vector_retrieval and self.embedding_model is not None:
-            # 确保问题和答案之间有空格，以便更好的embedding
-            if not question.endswith(" ") and not answer.startswith(" "):
-                full_text = question + " " + answer
-            else:
-                full_text = question + answer
+            full_text = question + answer
             embedding = self.embedding_model.encode(full_text, convert_to_numpy=True)
             self.knowledge_embeddings[key] = embedding
             print(f"✓ 已添加知识项: {key} (序列长度: {token_vectors.shape[0]}, 答案起始位置: {answer_start_idx})")
@@ -84,9 +80,16 @@ class KnowledgeCacheManager:
     def retrieve_by_similarity(self, 
                               query: str,
                               top_k: int = 1,
-                              threshold: float = 0.5) -> Optional[Tuple[torch.Tensor, int]]:
+                              threshold: float = 0.5,
+                              device: Optional[torch.device] = None) -> Optional[Tuple[torch.Tensor, int]]:
         """
         基于相似度检索知识
+        
+        Args:
+            query: 查询文本
+            top_k: 返回top k个结果
+            threshold: 相似度阈值
+            device: 目标设备（可选），如果提供，返回的张量将移动到该设备
         
         Returns:
             (token_vectors, answer_start_idx) 或 None
@@ -114,6 +117,10 @@ class KnowledgeCacheManager:
             
             token_vectors = self.knowledge_cache[best_key]
             answer_start_idx = self.answer_start_indices[best_key]
+            
+            # 如果指定了设备，将张量移动到该设备
+            if device is not None:
+                token_vectors = token_vectors.to(device)
             
             return token_vectors, answer_start_idx
             

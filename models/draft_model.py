@@ -139,7 +139,13 @@ class Qwen3DraftModel(nn.Module):
                     query_text = None
             
             if query_text:
-                result = self.knowledge_cache_manager.retrieve_by_similarity(query=query_text, top_k=1)
+                # 获取当前设备，确保知识向量在正确的设备上
+                device = hidden_states.device
+                result = self.knowledge_cache_manager.retrieve_by_similarity(
+                    query=query_text, 
+                    top_k=1,
+                    device=device  # 直接指定设备，避免后续设备不匹配
+                )
                 if result is not None:
                     knowledge_vectors, answer_start_idx = result
                     # 扩展batch维度
