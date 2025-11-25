@@ -13,7 +13,7 @@ class EnhancedDraftLayer(nn.Module):
     """增强的草稿层 - 使用基于向量的交叉注意力"""
     
     def __init__(self, original_layer: nn.Module, hidden_size: int, num_heads: int,
-                 use_cross_attention: bool = True):
+                 use_cross_attention: bool = True, dtype: torch.dtype = None):
         super().__init__()
         self.hidden_size = hidden_size
         self.num_heads = num_heads
@@ -31,6 +31,9 @@ class EnhancedDraftLayer(nn.Module):
                 hidden_size=hidden_size,
                 num_heads=num_heads
             )
+            # 如果指定了数据类型，确保交叉注意力层使用相同类型
+            if dtype is not None:
+                self.cross_attention = self.cross_attention.to(dtype=dtype)
     
     def forward(self,
                 hidden_states: torch.Tensor,
@@ -91,13 +94,16 @@ class Qwen3DraftModel(nn.Module):
         
         # 创建增强层
         self.enhanced_layers = nn.ModuleList()
+        # 获取目标模型的数据类型，确保新层使用相同类型
+        target_dtype = next(target_model.parameters()).dtype
         for idx in self.sampled_indices:
             original_layer = target_model.model.layers[idx]
             enhanced_layer = EnhancedDraftLayer(
                 original_layer=original_layer,
                 hidden_size=self.hidden_size,
                 num_heads=self.num_heads,
-                use_cross_attention=True
+                use_cross_attention=True,
+                dtype=target_dtype  # 传递数据类型，确保交叉注意力层使用相同类型
             )
             self.enhanced_layers.append(enhanced_layer)
         
@@ -139,8 +145,9 @@ class Qwen3DraftModel(nn.Module):
                     query_text = None
             
             if query_text:
-                # 获取当前设备，确保知识向量在正确的设备上
+                # 获取当前设备和数据类型，确保知识向量在正确的设备和数据类型上
                 device = hidden_states.device
+                dtype = hidden_states.dtype
                 result = self.knowledge_cache_manager.retrieve_by_similarity(
                     query=query_text, 
                     top_k=1,
@@ -148,6 +155,8 @@ class Qwen3DraftModel(nn.Module):
                 )
                 if result is not None:
                     knowledge_vectors, answer_start_idx = result
+                    # 确保数据类型匹配
+                    knowledge_vectors = knowledge_vectors.to(dtype=dtype)
                     # 扩展batch维度
                     if knowledge_vectors.dim() == 2:
                         knowledge_vectors = knowledge_vectors.unsqueeze(0)

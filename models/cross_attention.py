@@ -58,6 +58,14 @@ class VectorBasedCrossAttention(nn.Module):
         batch_size, query_seq_len, hidden_size = query_vectors.shape
         knowledge_seq_len = knowledge_vectors.shape[1]
         
+        # 确保输入数据类型与层参数类型匹配
+        # 如果层参数是float32但输入是float16，或者反之，需要转换
+        layer_dtype = next(self.q_proj.parameters()).dtype
+        if query_vectors.dtype != layer_dtype:
+            query_vectors = query_vectors.to(dtype=layer_dtype)
+        if knowledge_vectors.dtype != layer_dtype:
+            knowledge_vectors = knowledge_vectors.to(dtype=layer_dtype)
+        
         # 从向量投影得到QKV
         Q = self.q_proj(query_vectors)
         K = self.k_proj(knowledge_vectors)
