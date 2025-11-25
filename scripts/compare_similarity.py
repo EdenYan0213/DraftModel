@@ -16,6 +16,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.base_loader import Qwen3Loader
 from models.draft_model import Qwen3DraftModel
 from models.knowledge_cache import KnowledgeCacheManager
+from models.utils import get_device, print_device_info
 
 try:
     from sentence_transformers import SentenceTransformer
@@ -27,7 +28,7 @@ except ImportError:
     sys.exit(1)
 
 
-def load_model(config_path: str, checkpoint_path: str, device: str = 'cpu'):
+def load_model(config_path: str, checkpoint_path: str, device: str = 'auto'):
     """加载训练好的模型"""
     print(f"加载模型: {checkpoint_path}")
     
@@ -182,12 +183,8 @@ def main():
     print(f"使用检查点: {checkpoint_path}")
     
     # 设备选择
-    device = 'cpu'
-    if torch.cuda.is_available():
-        device = 'cuda'
-        print(f"使用设备: CUDA")
-    else:
-        print(f"使用设备: CPU")
+    device = get_device('auto')
+    print_device_info(device)
     
     # 加载模型
     draft_model, target_model, tokenizer = load_model(

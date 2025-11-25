@@ -3,6 +3,7 @@ import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer, AutoConfig
 import yaml
 from typing import Dict, Any
+from .utils import get_device, print_device_info
 
 class Qwen3Loader:
     """Qwen3-0.6B 模型加载器"""
@@ -21,15 +22,8 @@ class Qwen3Loader:
         
         try:
             # 设备选择：优先CUDA，其次MPS，最后CPU
-            if device == "auto":
-                if torch.cuda.is_available():
-                    device = "cuda"
-                elif hasattr(torch.backends, 'mps') and torch.backends.mps.is_available():
-                    device = "mps"
-                else:
-                    device = "cpu"
-            
-            print(f"使用设备: {device}")
+            device = get_device(device)
+            print_device_info(device)
             
             # MPS不支持float16，需要使用float32
             dtype = torch.float32 if device == "mps" else (torch.float16 if device == "cuda" else torch.float32)

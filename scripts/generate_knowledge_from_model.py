@@ -14,10 +14,13 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.base_loader import Qwen3Loader
 from models.knowledge_cache import KnowledgeCacheManager
+from models.utils import get_device, print_device_info
 
 
-def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str):
+def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str, device: str = 'auto'):
     """提取prefill阶段的token向量"""
+    # 确保设备参数被正确解析
+    device = get_device(device)
     # 确保问题和答案之间有空格，以便更好的tokenization
     if not question.endswith(" ") and not answer.startswith(" "):
         full_text = question + " " + answer
@@ -25,7 +28,7 @@ def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str)
         full_text = question + answer
     
     inputs = tokenizer(full_text, return_tensors="pt", padding=False, truncation=True, max_length=2048)
-    input_ids = inputs['input_ids']
+    input_ids = inputs['input_ids'].to(device)
     
     question_inputs = tokenizer(question, return_tensors="pt", padding=False, truncation=True, max_length=2048)
     question_len = question_inputs['input_ids'].shape[1]
@@ -34,6 +37,8 @@ def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str)
         outputs = target_model(input_ids=input_ids, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
         token_vectors = hidden_states.squeeze(0)
+        # 移动到CPU以便保存（保存时统一在CPU上，加载时更灵活）
+        token_vectors = token_vectors.cpu()
         answer_start_idx = question_len
     
     return token_vectors, answer_start_idx
@@ -79,13 +84,14 @@ def generate_answer(target_model, tokenizer, question: str, max_new_tokens: int 
     return generated_text
 
 
-def build_knowledge_cache_from_faq_pairs(faq_pairs, output_path=None, append=False):
+def build_knowledge_cache_from_faq_pairs(faq_pairs, output_path=None, append=False, device: str = 'auto'):
     """从FAQ问答对构建知识缓存
     
     Args:
         faq_pairs: 问答对列表 [(question, answer), ...]
         output_path: 输出路径，如果为None则使用默认路径
         append: 是否追加到现有缓存（True）还是创建新缓存（False）
+        device: 设备选择，'auto'自动选择，'cuda'使用CUDA，'cpu'使用CPU
     
     Returns:
         knowledge_cache_manager: 知识缓存管理器
@@ -96,7 +102,14 @@ def build_knowledge_cache_from_faq_pairs(faq_pairs, output_path=None, append=Fal
     
     print("\n1. 加载目标模型...")
     loader = Qwen3Loader(config_path)
-    target_model = loader.load_target_model(device='cpu')
+    
+    # 设备选择
+    device = get_device(device)
+    print_device_info(device)
+    if device == 'cuda':
+        print("  (加速知识缓存构建)")
+    
+    target_model = loader.load_target_model(device=device)
     tokenizer = loader.load_tokenizer()
     target_model.eval()
     
@@ -142,7 +155,7 @@ def build_knowledge_cache_from_faq_pairs(faq_pairs, output_path=None, append=Fal
             # 提取向量
             print(f"  ⏳ 正在提取token向量...")
             token_vectors, answer_start_idx = extract_prefill_vectors(
-                target_model, tokenizer, question, answer
+                target_model, tokenizer, question, answer, device=device
             )
             
             # 添加到知识缓存

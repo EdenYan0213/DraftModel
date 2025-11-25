@@ -150,8 +150,17 @@ class KnowledgeCacheManager:
         torch.save(data, filepath)
         print(f"✓ 知识缓存已保存: {filepath}")
     
-    def load(self, filepath: str):
-        """加载知识缓存"""
+    def load(self, filepath: str, device: str = 'auto'):
+        """
+        加载知识缓存
+        
+        Args:
+            filepath: 缓存文件路径
+            device: 加载设备，'auto'自动选择，'cuda'使用CUDA，'cpu'使用CPU
+        """
+        from .utils import get_device
+        load_device = get_device(device)
+        # 加载时使用CPU，避免设备不匹配，后续使用时再移动到目标设备
         data = torch.load(filepath, map_location='cpu', weights_only=False)
         self.knowledge_cache = data.get('knowledge_cache', {})
         self.answer_start_indices = data.get('answer_start_indices', {})

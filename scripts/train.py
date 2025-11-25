@@ -14,6 +14,7 @@ sys.path.append(str(Path(__file__).parent.parent))
 from models.base_loader import Qwen3Loader
 from models.draft_model import Qwen3DraftModel
 from models.knowledge_cache import KnowledgeCacheManager
+from models.utils import get_device, print_device_info
 from training.draft_trainer import DraftModelTrainer
 from training.data_utils import create_sample_dataloader
 
@@ -89,12 +90,8 @@ def main():
     print(f"\n3. 创建草稿模型...")
     draft_model = Qwen3DraftModel(config, target_model, knowledge_cache_manager=knowledge_cache_manager)
     
-    device = 'cpu'
-    if torch.cuda.is_available():
-        device = 'cuda'
-        print(f"使用设备: CUDA")
-    else:
-        print(f"使用设备: CPU")
+    device = get_device('auto')
+    print_device_info(device)
     
     draft_model = draft_model.to(device)
     target_model = target_model.to(device)

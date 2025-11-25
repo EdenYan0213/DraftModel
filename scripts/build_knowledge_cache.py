@@ -13,14 +13,17 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from models.base_loader import Qwen3Loader
 from models.knowledge_cache import KnowledgeCacheManager
+from models.utils import get_device, print_device_info
 
 
-def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str):
+def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str, device: str = 'auto'):
     """提取prefill阶段的token向量"""
+    # 确保设备参数被正确解析
+    device = get_device(device)
     full_text = question + answer
     
     inputs = tokenizer(full_text, return_tensors="pt", padding=False, truncation=True, max_length=2048)
-    input_ids = inputs['input_ids']
+    input_ids = inputs['input_ids'].to(device)
     
     question_inputs = tokenizer(question, return_tensors="pt", padding=False, truncation=True, max_length=2048)
     question_len = question_inputs['input_ids'].shape[1]
@@ -29,6 +32,8 @@ def extract_prefill_vectors(target_model, tokenizer, question: str, answer: str)
         outputs = target_model(input_ids=input_ids, output_hidden_states=True)
         hidden_states = outputs.hidden_states[-1]
         token_vectors = hidden_states.squeeze(0)
+        # 移动到CPU以便保存（保存时统一在CPU上，加载时更灵活）
+        token_vectors = token_vectors.cpu()
         answer_start_idx = question_len
     
     return token_vectors, answer_start_idx
@@ -46,7 +51,14 @@ def main():
     
     print("\n1. 加载目标模型...")
     loader = Qwen3Loader(config_path)
-    target_model = loader.load_target_model(device='cpu')
+    
+    # 自动选择设备：优先CUDA，其次CPU
+    device = get_device('auto')
+    print_device_info(device)
+    if device == 'cuda':
+        print("  (加速知识缓存构建)")
+    
+    target_model = loader.load_target_model(device=device)
     tokenizer = loader.load_tokenizer()
     target_model.eval()
     
@@ -75,7 +87,7 @@ def main():
         print(f"\n处理: {question}")
         try:
             token_vectors, answer_start_idx = extract_prefill_vectors(
-                target_model, tokenizer, question, answer
+                target_model, tokenizer, question, answer, device=device
             )
             knowledge_cache_manager.add_knowledge(
                 key=question,
