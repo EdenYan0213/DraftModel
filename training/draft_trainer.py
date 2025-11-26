@@ -25,6 +25,29 @@ class DraftModelTrainer:
         self.knowledge_cache_manager = knowledge_cache_manager
         self.device = next(draft_model.parameters()).device
         
+        # 重要：冻结目标模型的所有参数，防止训练时污染基础模型
+        # 因为草稿模型共享了基础模型的某些组件（embed_tokens, norm, lm_head, layers）
+        for param in self.target_model.parameters():
+            param.requires_grad = False
+        self.target_model.eval()  # 确保目标模型处于评估模式
+        
+        # 验证共享参数也被冻结了
+        shared_params_frozen = True
+        if hasattr(self.draft_model, 'embed_tokens'):
+            if self.draft_model.embed_tokens.weight.requires_grad:
+                shared_params_frozen = False
+        if hasattr(self.draft_model, 'norm'):
+            if any(p.requires_grad for p in self.draft_model.norm.parameters()):
+                shared_params_frozen = False
+        if hasattr(self.draft_model, 'lm_head'):
+            if self.draft_model.lm_head.weight.requires_grad:
+                shared_params_frozen = False
+        
+        if shared_params_frozen:
+            print("✓ 已冻结目标模型参数，防止训练时污染基础模型")
+        else:
+            print("⚠ 警告: 检测到共享参数未被完全冻结，可能存在参数污染风险")
+        
         # 训练配置
         training_config = config['training']
         self.batch_size = int(training_config['batch_size'])
@@ -42,8 +65,13 @@ class DraftModelTrainer:
         
     def setup_training(self, total_steps: int):
         """设置训练组件"""
+        # 只优化需要训练的参数（交叉注意力层和草稿模型特有的参数）
+        # 由于草稿模型共享了基础模型的某些组件，我们需要确保只优化可训练的参数
+        trainable_params = [p for p in self.draft_model.parameters() if p.requires_grad]
+        print(f"可训练参数数量: {sum(p.numel() for p in trainable_params):,}")
+        
         self.optimizer = torch.optim.AdamW(
-            self.draft_model.parameters(),
+            trainable_params,  # 只优化需要训练的参数
             lr=self.learning_rate,
             weight_decay=0.01,
             betas=(0.9, 0.999)
