@@ -90,7 +90,7 @@ def main():
     print(f"\n3. 创建草稿模型...")
     draft_model = Qwen3DraftModel(config, target_model, knowledge_cache_manager=knowledge_cache_manager)
     
-    device = get_device('auto')
+    device = get_device('cpu')
     print_device_info(device)
     
     draft_model = draft_model.to(device)

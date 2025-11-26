@@ -66,6 +66,7 @@ class DraftModelTrainer:
         self.draft_model.train()
         total_loss = 0
         total_batches = len(dataloader)
+        skipped_batches = 0  # 记录跳过的batch数量
         
         progress_bar = tqdm(dataloader, desc=f"Epoch {epoch}", file=sys.stdout, dynamic_ncols=True)
         
@@ -77,7 +78,11 @@ class DraftModelTrainer:
             
             # 标准做法：检测到NaN/Inf时，跳过这个batch，不更新参数
             if torch.isnan(loss) or torch.isinf(loss):
-                print(f"\n⚠ 警告: 检测到NaN/Inf loss (step {step+1})，跳过此批次")
+                skipped_batches += 1
+                if skipped_batches <= 5:  # 只打印前5个警告，避免刷屏
+                    print(f"\n⚠ 警告: 检测到NaN/Inf loss (step {step+1})，跳过此批次")
+                elif skipped_batches == 6:
+                    print(f"\n⚠ 警告: 已跳过多个批次，后续警告将不再显示...")
                 # 清零梯度，避免累积
                 self.optimizer.zero_grad()
                 continue
@@ -103,14 +108,19 @@ class DraftModelTrainer:
                     self.optimizer.zero_grad()
             
             total_loss += loss.item()
-            avg_loss = total_loss / (step + 1)
+            avg_loss = total_loss / (step + 1 - skipped_batches) if (step + 1 - skipped_batches) > 0 else 0
             progress_bar.set_postfix({
                 'loss': f'{loss.item():.4f}',
                 'avg_loss': f'{avg_loss:.4f}',
-                'lr': f'{self.scheduler.get_last_lr()[0]:.2e}'
+                'lr': f'{self.scheduler.get_last_lr()[0]:.2e}',
+                'skipped': skipped_batches
             })
         
-        return total_loss / total_batches
+        if skipped_batches > 0:
+            print(f"\n⚠ 本epoch共跳过了 {skipped_batches}/{total_batches} 个批次 ({skipped_batches/total_batches*100:.1f}%)")
+        
+        valid_batches = total_batches - skipped_batches
+        return total_loss / valid_batches if valid_batches > 0 else float('inf')
     
     def _prepare_batch(self, batch: Dict[str, Any]) -> Dict[str, torch.Tensor]:
         """准备训练批次"""

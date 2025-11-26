@@ -53,7 +53,7 @@ def main():
     loader = Qwen3Loader(config_path)
     
     # 自动选择设备：优先CUDA，其次CPU
-    device = get_device('auto')
+    device = get_device('cpu')
     print_device_info(device)
     if device == 'cuda':
         print("  (加速知识缓存构建)")

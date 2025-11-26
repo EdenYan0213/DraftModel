@@ -43,11 +43,12 @@ class VectorBasedCrossAttention(nn.Module):
     
     def _init_weights(self):
         """初始化权重"""
-        # 使用Xavier初始化，但使用较小的增益
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        # 使用标准的Xavier初始化（gain=1.0），确保有足够的学习能力
+        # 之前使用gain=0.1太小，导致交叉注意力层几乎不学习
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=1.0)
         
         # 偏置初始化为0
         if self.q_proj.bias is not None:
